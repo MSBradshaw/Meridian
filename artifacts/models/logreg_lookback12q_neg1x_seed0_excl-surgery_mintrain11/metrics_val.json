@@ -1,0 +1,29 @@
+{
+  "features_file": "artifacts/features/features_onehot_lookback12q_neg1x_seed0_excl-surgery_mintrain11.csv",
+  "model": "LogisticRegression (L2)",
+  "C": 1.0,
+  "n_features": 112,
+  "train": {
+    "patients": 3666,
+    "positives": 1832,
+    "roc_auc": 0.7518207452153167
+  },
+  "val": {
+    "patients": 796,
+    "positives": 406,
+    "positive_rate": 0.5100502512562815,
+    "roc_auc": 0.6912056334470127,
+    "average_precision": 0.7016892470073104,
+    "brier": 0.22340027809323776,
+    "log_loss": 0.6429895839875392,
+    "precision_top_5%": 0.85,
+    "recall_top_5%": 0.08374384236453201,
+    "lift_top_5%": 1.666502463054187,
+    "precision_top_10%": 0.8375,
+    "recall_top_10%": 0.16502463054187191,
+    "lift_top_10%": 1.6419950738916256,
+    "precision_top_20%": 0.7987421383647799,
+    "recall_top_20%": 0.312807881773399,
+    "lift_top_20%": 1.5660067540353813
+  }
+}
