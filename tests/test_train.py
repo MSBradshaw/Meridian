@@ -34,16 +34,20 @@ def features(seed=0, n=400):
     return df
 
 
-def write(df, tmp_path, name="features_onehot_lookback4q_neg1x_seed0_excl-surgery_mintrain11.csv"):
+def write(df, tmp_path, name="features_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo.csv"):
     path = tmp_path / name
     df.to_csv(path, index=False)
     return path
 
 
+PROBE = pd.DataFrame({"f_noise": [0, 1, 0, 1], "f_signal": [0, 0, 1, 1]})
+
+
 def outputs(run_dir):
+    """The fitted model's predictions on a fixed probe grid, and the metrics report."""
     with open(run_dir / "model.pkl", "rb") as f:
         model = pickle.load(f)["model"]
-    return model.coef_.copy(), json.loads((run_dir / "metrics_val.json").read_text())
+    return model.predict_proba(PROBE)[:, 1], json.loads((run_dir / "metrics_val.json").read_text())
 
 
 def test_read_features_drops_test_and_holdout(tmp_path):
@@ -51,24 +55,26 @@ def test_read_features_drops_test_and_holdout(tmp_path):
     assert set(kept.split) == {"train", "val"}
 
 
-def test_test_and_holdout_rows_do_not_affect_the_model(tmp_path):
+@pytest.mark.parametrize("model", ["logreg", "xgboost"])
+def test_test_and_holdout_rows_do_not_affect_the_model(tmp_path, model):
     base = features()
-    coef_a, metrics_a = outputs(train(write(base, tmp_path), out_dir=tmp_path / "a"))
+    coef_a, metrics_a = outputs(train(write(base, tmp_path), out_dir=tmp_path / "a", model=model))
 
     scrambled = base.copy()
     other = scrambled.split.isin(["test", "holdout"])
     scrambled.loc[other, ["f_noise", "f_signal"]] = 999  # nonsense values
     scrambled.loc[other, "label"] = pd.NA  # and no labels
-    coef_b, metrics_b = outputs(train(write(scrambled, tmp_path), out_dir=tmp_path / "b"))
+    coef_b, metrics_b = outputs(train(write(scrambled, tmp_path), out_dir=tmp_path / "b", model=model))
 
     np.testing.assert_array_equal(coef_a, coef_b)
     metrics_a.pop("features_file"), metrics_b.pop("features_file")
     assert metrics_a == metrics_b
 
 
-def test_metrics_report_is_on_val(tmp_path):
+@pytest.mark.parametrize("model", ["logreg", "xgboost"])
+def test_metrics_report_is_on_val(tmp_path, model):
     df = features()
-    run_dir = train(write(df, tmp_path), out_dir=tmp_path)
+    run_dir = train(write(df, tmp_path), out_dir=tmp_path, model=model)
     report = json.loads((run_dir / "metrics_val.json").read_text())
     assert report["val"]["patients"] == (df.split == "val").sum()
     assert report["train"]["patients"] == (df.split == "train").sum()
@@ -80,12 +86,27 @@ def test_metrics_report_is_on_val(tmp_path):
 
 def test_run_outputs(tmp_path):
     run_dir = train(write(features(), tmp_path), out_dir=tmp_path)
-    assert run_dir.name == "logreg_lookback4q_neg1x_seed0_excl-surgery_mintrain11"
+    assert run_dir.name == "logreg_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo"
     assert {p.name for p in run_dir.iterdir()} == {"model.pkl", "metrics_val.json", "calibration_val.csv", "coefficients.csv"}
     coef = pd.read_csv(run_dir / "coefficients.csv")
     assert coef.feature.iloc[0] == "f_signal"  # largest weight first
     calib = pd.read_csv(run_dir / "calibration_val.csv")
     assert calib.patients.sum() == (features().split == "val").sum()
+
+
+def test_xgboost_run_outputs(tmp_path):
+    run_dir = train(write(features(), tmp_path), out_dir=tmp_path, model="xgboost")
+    assert run_dir.name == "xgboost_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo"
+    assert {p.name for p in run_dir.iterdir()} == {"model.pkl", "metrics_val.json", "calibration_val.csv", "feature_importance.csv"}
+    importance = pd.read_csv(run_dir / "feature_importance.csv")
+    assert importance.feature.iloc[0] == "f_signal"
+    report = json.loads((run_dir / "metrics_val.json").read_text())
+    assert report["model"] == "XGBClassifier" and report["params"]["max_depth"] == 3
+
+
+def test_unknown_model_fails(tmp_path):
+    with pytest.raises(ValueError, match="model must be one of"):
+        train(write(features(), tmp_path), out_dir=tmp_path, model="forest")
 
 
 def test_missing_val_or_labels_fail_loudly(tmp_path):
@@ -115,6 +136,35 @@ def test_calibration_table_bins():
 
 
 def test_run_name():
-    assert run_name("x/features_onehot_lookback8q_neg1x_seed0_excl-none_mintrain11.csv") == (
-        "logreg_lookback8q_neg1x_seed0_excl-none_mintrain11"
+    assert run_name("x/features_count_minmax_lookback8q_neg1x_seed0_excl-none_mintrain11_demo.csv") == (
+        "logreg_count_minmax_lookback8q_neg1x_seed0_excl-none_mintrain11_demo"
     )
+    assert run_name("features_onehot_lookback4q_neg1x_seed0_excl-surgery_mintrain11.csv") == (
+        "logreg_onehot_lookback4q_neg1x_seed0_excl-surgery_mintrain11"
+    )
+
+
+@pytest.mark.parametrize("model", ["logreg", "xgboost"])
+def test_labels_file_replaces_label_and_drops_unlabelled(tmp_path, model):
+    df = features()
+    rng = np.random.default_rng(1)
+    task = pd.DataFrame({"patient_token": df.patient_token, "label": pd.array(rng.integers(0, 2, len(df)), dtype="Int8")})
+    task.loc[df.index[::10], "label"] = pd.NA  # excluded for this task
+    labels_file = tmp_path / "labels_enroll-PT_h4q_lookback4q_neg1x_seed0.csv"
+    task.to_csv(labels_file, index=False)
+
+    run_dir = train(write(df, tmp_path), out_dir=tmp_path, model=model, labels_file=labels_file)
+    assert run_dir.name == f"{model}_enroll-PT_h4q_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo"
+    report = json.loads((run_dir / "metrics_val.json").read_text())
+    assert report["task"] == "enroll-PT_h4q"
+    kept = df.assign(label=task.label)[df.split.isin(["train", "val"]) & task.label.notna()]
+    assert report["train"]["patients"] == (kept.split == "train").sum()
+    assert report["val"]["patients"] == (kept.split == "val").sum()
+    assert report["val"]["positives"] == int(kept.loc[kept.split == "val", "label"].sum())
+    dropped = df[df.split.isin(["train", "val"]) & task.label.isna()].split.value_counts()
+    assert report["excluded_unlabelled"] == {s: int(dropped.get(s, 0)) for s in ["train", "val"]}
+
+
+def test_surgery_task_is_the_default(tmp_path):
+    report = json.loads((train(write(features(), tmp_path), out_dir=tmp_path) / "metrics_val.json").read_text())
+    assert report["task"] == "surgery" and report["labels_file"] is None and report["excluded_unlabelled"] == {}

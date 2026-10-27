@@ -1,10 +1,16 @@
-"""One-hot code features per patient, built inside each patient's splits window.
+"""Code-count features per patient, built inside each patient's splits window.
 
 Input is a splits file from `assignment.splits` (one row per patient with
 `split`, `label`, `start_date`, `end_date`). Output is one row per patient in
-that file: `patient_token, split, label`, then one 0/1 column per feature in
-the vocabulary, named `{code_system}_{code}` (e.g. `CPT_72148`,
-`ICD10CM_M54.50`, `NDC_65862003900`). Every split has the same columns.
+that file: `patient_token, split, label`, then one column per code in the
+vocabulary, named `{code_system}_{code}` (e.g. `CPT_72148`, `ICD10CM_M54.50`,
+`NDC_65862003900`). Every split has the same columns.
+
+    Encoding   `count` (default): rows for the code in the window, across
+               sources. `binary`: 1 if the code appears at all.
+    Scaling    min-max on the code columns and `age`, with min/max fitted on
+               train rows only and applied unchanged to val/test/holdout (no
+               leakage). On by default; `scale=False` writes raw values.
 
     Vocabulary codes that at least `min_train_patients` (default 11, i.e. more
                than 10) train patients have in their window. Chosen on train
@@ -17,6 +23,9 @@ the vocabulary, named `{code_system}_{code}` (e.g. `CPT_72148`,
                surgery codes, which define the label.
     Demographics  `age` (2026 - birth_year) and one-hot `sex_F/M/U` from the
                patients table, placed after the ID columns and always kept.
+    Specialties  `specialty_<name>`: claim lines in the window per provider
+               specialty, for all 15 specialties in the data dictionary; always
+               kept, counted and min-max scaled like the codes.
 
 As a module:
 
@@ -42,22 +51,41 @@ ID_COLUMNS = ["patient_token", "split", "label"]
 SPLIT_ORDER = ["train", "val", "test", HOLDOUT]
 
 MIN_TRAIN_PATIENTS = 11  # keep features more than 10 train patients have
+ENCODINGS = {"count": "count", "binary": "onehot"}  # encoding -> filename tag
 
 AGE_REFERENCE_YEAR = 2026
 SEX_CATEGORIES = ("F", "M", "U")
 DEMOGRAPHIC_COLUMNS = ["age", *(f"sex_{s}" for s in SEX_CATEGORIES)]
+
+# Every provider_specialty value in the data dictionary; one count column each,
+# kept whatever the vocabulary so the schema is stable across extracts.
+SPECIALTIES = (
+    "Orthopedic Surgery", "Neurosurgery", "Physical Therapy", "Pain Management", "Primary Care",
+    "Rheumatology", "Radiology", "Emergency Medicine", "Anesthesiology", "Chiropractic",
+    "Cardiology", "Nephrology", "Endocrinology", "Behavioral Health", "Other",
+)  # fmt: skip
+SPECIALTY_PREFIX = "specialty_"
+
+
+def specialty_column(specialty: str) -> str:
+    """`Orthopedic Surgery` -> `specialty_orthopedic_surgery`."""
+    return SPECIALTY_PREFIX + specialty.lower().replace(" ", "_")
 
 SPLITS_DIR = Path("artifacts/splits")
 FEATURES_DIR = Path("artifacts/features")
 
 
 def load_code_events(data_dir: Path = Path("data"), sources: Iterable[str] = SOURCES) -> pd.DataFrame:
-    """Every coded event as `patient_token, date, code_system, code`, from the chosen sources."""
+    """Every dated event as `patient_token, date, code_system, code, provider_specialty`.
+
+    `code` may be missing (such rows still count toward specialties);
+    `provider_specialty` is only present on claims.
+    """
     frames = []
     if "claims" in sources:
         claims = pd.read_csv(
             claims_path(data_dir),
-            usecols=["patient_token", "service_date", "code_system", "code"],
+            usecols=["patient_token", "service_date", "code_system", "code", "provider_specialty"],
             dtype=str,
             parse_dates=["service_date"],
         )
@@ -73,7 +101,7 @@ def load_code_events(data_dir: Path = Path("data"), sources: Iterable[str] = SOU
     if not frames:
         raise ValueError(f"no known sources in {list(sources)}; choose from {SOURCES}")
     events = pd.concat(frames, ignore_index=True)
-    return events.dropna(subset=["patient_token", "date", "code_system", "code"])
+    return events.dropna(subset=["patient_token", "date"])
 
 
 def load_demographics(data_dir: Path = Path("data")) -> pd.DataFrame:
@@ -101,8 +129,13 @@ def demographic_features(splits: pd.DataFrame, demographics: pd.DataFrame) -> pd
     return out
 
 
+def specialty_columns(features: pd.DataFrame) -> list[str]:
+    return [c for c in features.columns if c.startswith(SPECIALTY_PREFIX)]
+
+
 def code_columns(features: pd.DataFrame) -> list[str]:
-    return [c for c in features.columns if c not in ID_COLUMNS and c not in DEMOGRAPHIC_COLUMNS]
+    other = {*ID_COLUMNS, *DEMOGRAPHIC_COLUMNS, *specialty_columns(features)}
+    return [c for c in features.columns if c not in other]
 
 
 def train_vocabulary(onehot: pd.DataFrame, splits: pd.DataFrame, min_train_patients: int) -> list[str]:
@@ -110,8 +143,8 @@ def train_vocabulary(onehot: pd.DataFrame, splits: pd.DataFrame, min_train_patie
     train_ids = splits.loc[splits["split"] == "train", "patient_token"]
     if train_ids.empty:
         raise ValueError("splits has no train patients to choose a vocabulary from; pass `vocabulary`")
-    train_counts = onehot.loc[train_ids].sum()
-    return sorted(train_counts[train_counts >= min_train_patients].index)
+    train_patients = (onehot.loc[train_ids] > 0).sum()
+    return sorted(train_patients[train_patients >= min_train_patients].index)
 
 
 def build_features(
@@ -121,10 +154,16 @@ def build_features(
     min_train_patients: int = MIN_TRAIN_PATIENTS,
     vocabulary: Iterable[str] | None = None,
     demographics: pd.DataFrame | None = None,
+    encoding: str = "count",
+    specialties: Iterable[str] | None = None,
 ) -> pd.DataFrame:
-    """One row per patient in `splits` with a 0/1 column per feature in the vocabulary.
+    """One row per patient in `splits` with a column per code in the vocabulary.
 
-    The vocabulary is chosen on train only: features that at least
+    `encoding="count"` (default): number of rows for the code in the patient's
+    window, across all sources. `encoding="binary"`: 1 if the code appears, else 0.
+    Values are unscaled; see `fit_minmax` / `apply_minmax`.
+
+    The vocabulary is chosen on train only: codes that at least
     `min_train_patients` train patients have. Every split gets exactly those
     columns, so codes never (or rarely) seen in train are dropped. Pass
     `vocabulary` to reuse an existing one instead, e.g. when scoring.
@@ -132,27 +171,76 @@ def build_features(
 
     If `demographics` (see `load_demographics`) is given, `age` and `sex_F/M/U`
     are added after the ID columns. They are always kept, whatever the vocabulary.
+
+    If `specialties` (e.g. `SPECIALTIES`) is given, one `specialty_<name>` column
+    per specialty counts the patient's claim lines in the window from a provider
+    of that specialty (any code, or none), after the demographics. Always kept.
+    Rows with an ignored code count toward neither codes nor specialties.
     """
+    if encoding not in ENCODINGS:
+        raise ValueError(f"encoding must be one of {list(ENCODINGS)}")
     windows = splits[["patient_token", "start_date", "end_date"]]
     events = events[~events["code"].isin(set(ignore_codes))]
     in_window = events.merge(windows, on="patient_token")
     in_window = in_window[in_window["date"].between(in_window["start_date"], in_window["end_date"])]
 
-    present = (in_window["code_system"] + "_" + in_window["code"]).rename("feature")
-    onehot = (
-        pd.crosstab(in_window["patient_token"], present)
-        .clip(upper=1)
-        .astype("int8")
-        .reindex(splits["patient_token"], fill_value=0)
-    )
+    coded = in_window.dropna(subset=["code_system", "code"])
+    feature = (coded["code_system"] + "_" + coded["code"]).rename("feature")
+    codes = pd.crosstab(coded["patient_token"], feature).reindex(splits["patient_token"], fill_value=0)
+    if encoding == "binary":
+        codes = codes.clip(upper=1)
     if vocabulary is None:
-        vocabulary = train_vocabulary(onehot, splits, min_train_patients)
-    onehot = onehot.reindex(columns=sorted(vocabulary), fill_value=0).astype("int8")
-    onehot.columns.name = None
+        vocabulary = train_vocabulary(codes, splits, min_train_patients)
+    codes = codes.reindex(columns=sorted(vocabulary), fill_value=0).astype("int32")
+    codes.columns.name = None
     parts = [splits[ID_COLUMNS].reset_index(drop=True)]
     if demographics is not None:
         parts.append(demographic_features(splits, demographics))
-    return pd.concat([*parts, onehot.reset_index(drop=True)], axis=1)
+    if specialties is not None:
+        parts.append(specialty_features(splits, in_window, list(specialties)))
+    return pd.concat([*parts, codes.reset_index(drop=True)], axis=1)
+
+
+def specialty_features(splits: pd.DataFrame, in_window: pd.DataFrame, specialties: list[str]) -> pd.DataFrame:
+    """Claim-line counts per provider specialty, one row per patient in `splits` order."""
+    if "provider_specialty" in in_window.columns:
+        rows = in_window[in_window["provider_specialty"].isin(specialties)]
+    else:
+        rows = in_window.iloc[:0].assign(provider_specialty=pd.Series(dtype=str))
+    counts = (
+        pd.crosstab(rows["patient_token"], rows["provider_specialty"])
+        .reindex(index=splits["patient_token"], columns=specialties, fill_value=0)
+        .astype("int32")
+    )
+    counts.columns = [specialty_column(s) for s in specialties]
+    return counts.reset_index(drop=True)
+
+
+def scaled_columns(features: pd.DataFrame) -> list[str]:
+    """Columns min-max scaled: age, specialty counts and code columns. Sex columns are already 0/1."""
+    counted = {*code_columns(features), *specialty_columns(features)}
+    return [c for c in features.columns if c == "age" or c in counted]
+
+
+def fit_minmax(features: pd.DataFrame) -> pd.DataFrame:
+    """Per scaled column, the min and max over **train rows only**, so nothing leaks from val/test/holdout."""
+    train = features.loc[features["split"] == "train", scaled_columns(features)]
+    if train.empty:
+        raise ValueError("features has no train rows to fit scaling on")
+    scaling = pd.DataFrame({"min": train.min(), "max": train.max()}).astype(float)
+    scaling.index.name = "feature"
+    return scaling
+
+
+def apply_minmax(features: pd.DataFrame, scaling: pd.DataFrame) -> pd.DataFrame:
+    """`(x - min) / (max - min)` with the given train min/max. Not clipped: rows outside
+    train's range (only possible outside train) fall below 0 or above 1. A column
+    constant in train has range 1, so it is only shifted."""
+    out = features.copy()
+    cols = list(scaling.index)
+    span = (scaling["max"] - scaling["min"]).replace(0, 1.0)
+    out[cols] = (features[cols].astype(float) - scaling["min"]) / span
+    return out
 
 
 def ignore_tag(ignore_codes: Iterable[str]) -> str:
@@ -171,20 +259,33 @@ def features_filename(
     ignore_codes: Iterable[str] = SURGERY_CODES,
     min_train_patients: int = MIN_TRAIN_PATIENTS,
     include_demographics: bool = True,
+    encoding: str = "count",
+    scale: bool = True,
+    include_specialties: bool = True,
 ) -> str:
     """`patient_windows_lookback4q_neg1x_seed0.csv`
-    -> `features_onehot_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo.csv`."""
+    -> `features_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo_spec.csv`."""
     stem = Path(splits_file).stem.removeprefix("patient_windows_")
-    demo = "_demo" if include_demographics else ""
-    return f"features_onehot_{stem}_{ignore_tag(ignore_codes)}_mintrain{min_train_patients}{demo}.csv"
+    kind = ENCODINGS[encoding] + ("_minmax" if scale else "")
+    extras = ("_demo" if include_demographics else "") + ("_spec" if include_specialties else "")
+    return f"features_{kind}_{stem}_{ignore_tag(ignore_codes)}_mintrain{min_train_patients}{extras}.csv"
+
+
+def sidecar_path(features_path: Path, name: str) -> Path:
+    """`<features file>_<name>.csv`: vocabulary, scaling, coverage or summary."""
+    return features_path.with_name(f"{features_path.stem}_{name}.csv")
 
 
 def vocabulary_path(features_path: Path) -> Path:
-    return features_path.with_name(features_path.stem + "_vocabulary.csv")
+    return sidecar_path(features_path, "vocabulary")
 
 
 def read_vocabulary(path: Path | str) -> list[str]:
     return pd.read_csv(path)["feature"].tolist()
+
+
+def read_scaling(path: Path | str) -> pd.DataFrame:
+    return pd.read_csv(path, index_col="feature")
 
 
 def read_splits(path: Path | str) -> pd.DataFrame:
@@ -204,12 +305,19 @@ def write_features(
     sources: Iterable[str] = SOURCES,
     min_train_patients: int = MIN_TRAIN_PATIENTS,
     include_demographics: bool = True,
+    encoding: str = "count",
+    scale: bool = True,
+    include_specialties: bool = True,
 ) -> Path:
     """Build the feature table for a splits file and write it to `out_dir`; returns its path.
 
     `splits_file` defaults to the default-parameter splits file for `lookback_quarters`,
-    which is generated if it does not exist yet. The chosen vocabulary is written
-    next to the features as `<features file>_vocabulary.csv` (feature, train_patients).
+    which is generated if it does not exist yet. Written next to the features:
+
+        _vocabulary.csv  feature, train_patients (patients with the code in train)
+        _scaling.csv     feature, min, max fitted on train (if `scale`)
+        _coverage.csv    `feature_coverage` of the unscaled features
+        _summary.csv     `coverage_summary` of the unscaled features
     """
     if splits_file is None:
         splits_file = SPLITS_DIR / splits_filename(lookback_quarters)
@@ -222,14 +330,24 @@ def write_features(
         ignore_codes,
         min_train_patients,
         demographics=load_demographics(data_dir) if include_demographics else None,
+        encoding=encoding,
+        specialties=SPECIALTIES if include_specialties else None,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / features_filename(splits_file, ignore_codes, min_train_patients, include_demographics)
-    features.to_csv(path, index=False)
-    train_patients = features.loc[features["split"] == "train", code_columns(features)].sum()
+    path = out_dir / features_filename(
+        splits_file, ignore_codes, min_train_patients, include_demographics, encoding, scale, include_specialties
+    )
+    train_patients = (features.loc[features["split"] == "train", code_columns(features)] > 0).sum()
     train_patients.rename_axis("feature").rename("train_patients").reset_index().to_csv(
         vocabulary_path(path), index=False
     )
+    feature_coverage(features).to_csv(sidecar_path(path, "coverage"))
+    coverage_summary(features).to_csv(sidecar_path(path, "summary"))
+    if scale:
+        scaling = fit_minmax(features)
+        scaling.to_csv(sidecar_path(path, "scaling"))
+        features = apply_minmax(features, scaling)
+    features.to_csv(path, index=False, float_format="%.6g")
     return path
 
 
@@ -238,10 +356,11 @@ def feature_coverage(features: pd.DataFrame) -> pd.DataFrame:
 
     Columns: `pct_<split>` (0-100) for train/val/test/holdout, `patients_total`,
     and `missing_in_train` (seen in val/test/holdout but never in train, so a
-    model cannot learn a weight for it). Covers the 0/1 columns: codes and sex.
+    model cannot learn a weight for it). Covers codes and sex; a patient "has"
+    a feature if its value is > 0, so pass **unscaled** features.
     """
-    binary_cols = [c for c in features.columns if c not in ID_COLUMNS and c != "age"]
-    by_split = features.groupby("split")[binary_cols]
+    present_cols = [c for c in features.columns if c not in ID_COLUMNS and c != "age"]
+    by_split = (features[present_cols] > 0).astype(int).groupby(features["split"])
     pct = (by_split.mean().T * 100).reindex(columns=SPLIT_ORDER).add_prefix("pct_")
     counts = by_split.sum().T.reindex(columns=SPLIT_ORDER, fill_value=0)
     report = pct.assign(
@@ -253,18 +372,20 @@ def feature_coverage(features: pd.DataFrame) -> pd.DataFrame:
 
 
 def coverage_summary(features: pd.DataFrame) -> pd.DataFrame:
-    """Per split: patients, code features present, mean codes per patient, share with no
-    codes, and mean age if the features include demographics."""
-    codes = code_columns(features)
-    codes_per_patient = features[codes].sum(axis=1)
-    grouped = codes_per_patient.groupby(features["split"])
-    present = features.groupby("split")[codes].max().sum(axis=1)
+    """Per split: patients, code features present, mean distinct codes and code events
+    per patient, share with no codes, and mean age if the features include
+    demographics. Pass **unscaled** features."""
+    codes = features[code_columns(features)]
+    present = codes > 0
+    split = features["split"]
+    distinct = present.sum(axis=1).groupby(split)
     summary = pd.DataFrame(
         {
-            "patients": grouped.size(),
-            "features_present": present,
-            "mean_codes_per_patient": grouped.mean().round(1),
-            "pct_patients_no_codes": (grouped.apply(lambda s: (s == 0).mean()) * 100).round(1),
+            "patients": distinct.size(),
+            "features_present": present.groupby(split).max().sum(axis=1),
+            "mean_codes_per_patient": distinct.mean().round(1),
+            "mean_code_events_per_patient": codes.sum(axis=1).groupby(split).mean().round(1),
+            "pct_patients_no_codes": (distinct.apply(lambda s: (s == 0).mean()) * 100).round(1),
         }
     )
     if "age" in features.columns:
@@ -273,7 +394,7 @@ def coverage_summary(features: pd.DataFrame) -> pd.DataFrame:
 
 
 def cli() -> None:
-    parser = argparse.ArgumentParser(description="Build one-hot code features for a splits file.")
+    parser = argparse.ArgumentParser(description="Build code-count features for a splits file.")
     parser.add_argument("--lookback-quarters", type=int, required=True)
     parser.add_argument("--splits-file", type=Path, help="defaults to the default splits file for the lookback")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -289,6 +410,9 @@ def cli() -> None:
         help=f"keep features at least this many train patients have (default {MIN_TRAIN_PATIENTS})",
     )
     parser.add_argument("--no-demographics", action="store_true", help="leave out age and sex")
+    parser.add_argument("--encoding", choices=list(ENCODINGS), default="count")
+    parser.add_argument("--no-scale", action="store_true", help="skip min-max scaling")
+    parser.add_argument("--no-specialties", action="store_true", help="leave out provider-specialty counts")
     args = parser.parse_args()
 
     path = write_features(
@@ -300,14 +424,15 @@ def cli() -> None:
         args.sources,
         args.min_train_patients,
         include_demographics=not args.no_demographics,
+        encoding=args.encoding,
+        scale=not args.no_scale,
+        include_specialties=not args.no_specialties,
     )
-    features = pd.read_csv(path, dtype={"patient_token": str, "split": str})
-    print(f"wrote {path}  ({len(features):,} patients x {features.shape[1] - len(ID_COLUMNS)} features)")
-    print(coverage_summary(features).to_string())
-    coverage = feature_coverage(features)
-    coverage_path = path.with_name(path.stem + "_coverage.csv")
-    coverage.to_csv(coverage_path)
-    print(f"wrote {coverage_path}; features missing in train: {int(coverage['missing_in_train'].sum())}")
+    n_features = len(pd.read_csv(path, nrows=0).columns) - len(ID_COLUMNS)
+    print(f"wrote {path}  ({n_features} features)")
+    print(pd.read_csv(sidecar_path(path, "summary"), index_col="split").to_string())
+    coverage = pd.read_csv(sidecar_path(path, "coverage"))
+    print(f"features missing in train: {int(coverage['missing_in_train'].sum())}")
 
 
 if __name__ == "__main__":

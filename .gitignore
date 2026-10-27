@@ -12,4 +12,7 @@ wheels/
 # Vi Internal Panelist Materials
 internal/
 
+# Model artifacts
+artifacts/
+
 .DS_Store

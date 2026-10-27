@@ -5,15 +5,22 @@ import pytest
 
 from assignment.features import (
     DEMOGRAPHIC_COLUMNS,
+    SPECIALTIES,
+    apply_minmax,
     build_features,
+    code_columns,
     coverage_summary,
     demographic_features,
     feature_coverage,
     features_filename,
+    fit_minmax,
     ignore_tag,
     load_code_events,
     read_splits,
+    read_scaling,
     read_vocabulary,
+    sidecar_path,
+    specialty_column,
     vocabulary_path,
     write_features,
 )
@@ -72,16 +79,19 @@ def test_one_row_per_patient_in_splits_order(features):
 
 def test_window_is_inclusive_and_nothing_outside_it_counts(features):
     assert features.loc["a", "ICD10CM_M54.50"] == 1
-    assert features.loc["a", "CPT_72148"] == 1
+    assert features.loc["a", "CPT_72148"] == 2  # two rows in window, incl. the last day
     assert "CPT_72100" not in features.columns
     assert features.loc["b", "NDC_65862003900"] == 0
     assert features.loc["d", "NDC_65862003900"] == 1
 
 
-def test_values_are_binary_and_patients_without_codes_are_all_zero(features):
-    codes = features.drop(columns=["split", "label"])
-    assert set(codes.to_numpy().ravel()) <= {0, 1}
-    assert codes.loc["c"].sum() == 0
+def test_binary_encoding_and_patients_without_codes_are_all_zero(features):
+    assert features.drop(columns=["split", "label"]).loc["c"].sum() == 0
+    binary = build_features(splits(), events(), min_train_patients=0, encoding="binary").set_index("patient_token")
+    assert set(binary.drop(columns=["split", "label"]).to_numpy().ravel()) <= {0, 1}
+    assert binary.loc["a", "CPT_72148"] == 1
+    with pytest.raises(ValueError, match="encoding"):
+        build_features(splits(), events(), encoding="tfidf")
 
 
 def test_surgery_codes_ignored_by_default(features):
@@ -103,12 +113,14 @@ def test_patients_outside_splits_are_dropped(features):
 
 def test_filename_tracks_splits_file_and_ignore_list():
     splits_file = "artifacts/splits/patient_windows_lookback6q_neg1x_seed0.csv"
-    assert features_filename(splits_file) == "features_onehot_lookback6q_neg1x_seed0_excl-surgery_mintrain11_demo.csv"
-    assert features_filename(splits_file, []) == "features_onehot_lookback6q_neg1x_seed0_excl-none_mintrain11_demo.csv"
-    assert features_filename(splits_file, min_train_patients=5).endswith("_excl-surgery_mintrain5_demo.csv")
-    assert features_filename(splits_file, include_demographics=False).endswith("_excl-surgery_mintrain11.csv")
+    assert features_filename(splits_file) == "features_count_minmax_lookback6q_neg1x_seed0_excl-surgery_mintrain11_demo_spec.csv"
+    assert features_filename(splits_file, []) == "features_count_minmax_lookback6q_neg1x_seed0_excl-none_mintrain11_demo_spec.csv"
+    assert features_filename(splits_file, include_specialties=False).endswith("_mintrain11_demo.csv")
+    assert features_filename(splits_file, encoding="binary", scale=False).startswith("features_onehot_lookback6q_")
+    assert features_filename(splits_file, min_train_patients=5).endswith("_excl-surgery_mintrain5_demo_spec.csv")
+    assert features_filename(splits_file, include_demographics=False).endswith("_excl-surgery_mintrain11_spec.csv")
     custom = features_filename(splits_file, [*SURGERY_CODES, "72148"])
-    assert custom.startswith("features_onehot_lookback6q_neg1x_seed0_excl-5codes-")
+    assert custom.startswith("features_count_minmax_lookback6q_neg1x_seed0_excl-5codes-")
     assert ignore_tag(["72148", *SURGERY_CODES]) == ignore_tag([*SURGERY_CODES, "72148"])
 
 
@@ -126,6 +138,7 @@ def test_coverage_summary(features):
     assert summary.loc["train", "patients"] == 2
     assert summary.loc["test", "pct_patients_no_codes"] == 100.0
     assert summary.loc["train", "features_present"] == 3
+    assert summary.loc["train", "mean_code_events_per_patient"] == 2.0  # a: 3 events, b: 1
 
 
 def test_write_features_round_trip(tmp_path, monkeypatch):
@@ -134,15 +147,51 @@ def test_write_features_round_trip(tmp_path, monkeypatch):
     monkeypatch.setattr("assignment.features.load_code_events", lambda data_dir, sources: events())
     monkeypatch.setattr("assignment.features.load_demographics", lambda data_dir: demographics())
     path = write_features(4, splits_file=splits_file, out_dir=tmp_path / "features", min_train_patients=1)
-    assert path.name == "features_onehot_lookback4q_neg1x_seed0_excl-surgery_mintrain1_demo.csv"
+    assert path.name == "features_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain1_demo_spec.csv"
     written = pd.read_csv(path, dtype={"patient_token": str})
-    expected = build_features(read_splits(splits_file), events(), min_train_patients=1, demographics=demographics())
+    expected = build_features(
+        read_splits(splits_file), events(), min_train_patients=1, demographics=demographics(), specialties=SPECIALTIES
+    )
     vocab = pd.read_csv(vocabulary_path(path))
     assert list(vocab.columns) == ["feature", "train_patients"]
-    assert read_vocabulary(vocabulary_path(path)) == list(expected.columns[3 + len(DEMOGRAPHIC_COLUMNS):])  # codes only
+    assert read_vocabulary(vocabulary_path(path)) == list(expected.columns[3 + len(DEMOGRAPHIC_COLUMNS) + len(SPECIALTIES):])  # codes only
     assert dict(zip(vocab.feature, vocab.train_patients)) == {"CPT_72148": 1, "HCPCS_G0446": 1, "ICD10CM_M54.50": 1}
     assert list(written.columns) == list(expected.columns)
-    assert (written.drop(columns=["split", "label"]).to_numpy() == expected.drop(columns=["split", "label"]).to_numpy()).all()
+    scaling = read_scaling(sidecar_path(path, "scaling"))
+    pd.testing.assert_frame_equal(scaling, fit_minmax(expected), check_dtype=False)
+    scaled = apply_minmax(expected, scaling).drop(columns=["patient_token", "split", "label"]).to_numpy()
+    assert abs(written.drop(columns=["patient_token", "split", "label"]).to_numpy() - scaled).max() < 1e-5
+    assert sidecar_path(path, "coverage").exists() and sidecar_path(path, "summary").exists()
+    unscaled = write_features(4, splits_file=splits_file, out_dir=tmp_path / "raw", min_train_patients=1, scale=False)
+    assert not sidecar_path(unscaled, "scaling").exists()
+    assert (pd.read_csv(unscaled).CPT_72148.tolist()) == [2, 0, 0, 0]
+
+
+def test_minmax_is_fitted_on_train_only():
+    f = build_features(splits(), events(), min_train_patients=0, demographics=demographics())
+    scaling = fit_minmax(f)
+    assert "sex_F" not in scaling.index  # already 0/1
+    assert scaling.loc["CPT_72148"].tolist() == [0.0, 2.0]
+    assert scaling.loc["age"].tolist() == [66.0, 76.0]  # train patients a (76) and b (66) only
+
+    changed = f.copy()
+    others = changed.split != "train"
+    changed.loc[others, "CPT_72148"] = 50
+    changed.loc[others, "age"] = 120.0
+    pd.testing.assert_frame_equal(fit_minmax(changed), scaling)
+
+
+def test_apply_minmax_maps_train_to_unit_range_and_does_not_clip_others():
+    f = build_features(splits(), events(), min_train_patients=0, demographics=demographics())
+    scaled = apply_minmax(f, fit_minmax(f)).set_index("patient_token")
+    train = scaled[scaled.split == "train"]
+    cols = list(fit_minmax(f).index)
+    assert train[cols].min().min() >= 0 and train[cols].max().max() <= 1
+    assert scaled.loc["a", "CPT_72148"] == 1.0
+    assert scaled.loc["a", "age"] == 1.0 and scaled.loc["b", "age"] == 0.0
+    assert scaled.loc["d", "age"] == pytest.approx(2.0)  # 86 with train range 66-76: outside, not clipped
+    assert scaled.loc["d", "NDC_65862003900"] == 1.0  # constant (0) in train -> range 1, only shifted
+    assert (scaled[["sex_F", "sex_M", "sex_U"]] == f.set_index("patient_token")[["sex_F", "sex_M", "sex_U"]]).all().all()
 
 
 def test_demographic_features():
@@ -204,5 +253,50 @@ def test_vocabulary_needs_train_patients():
 @pytest.mark.skipif(not (DATA_DIR / "meridian_health_patients.csv").exists(), reason="extract not present")
 def test_real_events_load_all_four_code_systems():
     events = load_code_events(DATA_DIR)
-    assert set(events.code_system) == {"ICD10CM", "CPT", "HCPCS", "NDC"}
-    assert events[["patient_token", "date", "code_system", "code"]].notna().all().all()
+    assert set(events.code_system.dropna()) == {"ICD10CM", "CPT", "HCPCS", "NDC"}
+    assert events[["patient_token", "date"]].notna().all().all()
+    assert set(events.provider_specialty.dropna()) <= set(SPECIALTIES)
+
+
+def specialty_events():
+    rows = [
+        ("a", "2024-02-01", "CPT", "72148", "Radiology"),
+        ("a", "2024-03-01", "ICD10CM", "M54.50", "Orthopedic Surgery"),
+        ("a", "2024-03-01", "CPT", "99213", "Orthopedic Surgery"),  # two lines, same visit -> 2
+        ("a", "2024-04-01", None, None, "Physical Therapy"),  # no code: still counts for the specialty
+        ("a", "2024-05-01", "CPT", "63047", "Orthopedic Surgery"),  # ignored surgery code: counts for neither
+        ("a", "2025-02-01", "CPT", "99213", "Radiology"),  # after the window
+        ("a", "2024-06-01", "NDC", "65862003900", None),  # pharmacy line, no specialty
+        ("b", "2024-06-01", "CPT", "99213", "Primary Care"),
+        ("d", "2026-06-30", "CPT", "99213", "Pain Management"),
+    ]
+    df = pd.DataFrame(rows, columns=["patient_token", "date", "code_system", "code", "provider_specialty"])
+    return df.assign(date=pd.to_datetime(df.date))
+
+
+def test_specialty_columns_count_claim_lines_in_window():
+    f = build_features(splits(), specialty_events(), min_train_patients=0, specialties=SPECIALTIES).set_index("patient_token")
+    spec = [specialty_column(s) for s in SPECIALTIES]
+    assert list(f.columns[2:2 + len(spec)]) == spec  # after the ID columns, before codes
+    assert f.loc["a", "specialty_orthopedic_surgery"] == 2
+    assert f.loc["a", "specialty_radiology"] == 1
+    assert f.loc["a", "specialty_physical_therapy"] == 1
+    assert f.loc["b", "specialty_primary_care"] == 1
+    assert f.loc["d", "specialty_pain_management"] == 1
+    assert f.loc["c", spec].sum() == 0
+    assert f["specialty_neurosurgery"].sum() == 0  # documented but absent: column kept, all zero
+    assert "CPT_63047" not in f.columns
+
+
+def test_specialties_are_scaled_on_train_and_not_codes():
+    f = build_features(splits(), specialty_events(), min_train_patients=0, specialties=SPECIALTIES)
+    scaling = fit_minmax(f)
+    assert scaling.loc["specialty_orthopedic_surgery"].tolist() == [0.0, 2.0]
+    assert "specialty_orthopedic_surgery" not in code_columns(f)
+    summary = coverage_summary(f)
+    assert summary.loc["train", "mean_code_events_per_patient"] == 2.5  # a: 72148, M54.50, 99213, NDC; b: 99213
+
+
+def test_specialties_optional():
+    f = build_features(splits(), events(), min_train_patients=0)
+    assert not [c for c in f.columns if c.startswith("specialty_")]

@@ -76,8 +76,12 @@ Candidates that fail the coverage or recency filter are dropped from the output 
 Implemented in [`assignment/features.py`](assignment/features.py) and tested in
 [`tests/test_features.py`](tests/test_features.py).
 
-### F1. One-hot code presence inside the splits window
-Each patient gets one 0/1 column per code, set to 1 if the code appears on any date in that patient's `[start_date, end_date]` window from the splits file, inclusive. Columns are named `{code_system}_{code}` (`CPT_72148`, `ICD10CM_M54.50`, `NDC_65862003900`, `HCPCS_G0446`), so codes from different systems can't collide. Counts and recency are deliberately left out for v1.
+### F1. Code counts inside the splits window (was: one-hot presence)
+Each patient gets one column per code: the **number of rows** with that code on any date in the patient's `[start_date, end_date]` window from the splits file, inclusive, summed across claims and encounters. Columns are named `{code_system}_{code}` (`CPT_72148`, `ICD10CM_M54.50`, `NDC_65862003900`, `HCPCS_G0446`), so codes from different systems can't collide. `encoding="binary"` still gives the earlier 0/1 presence features. Recency is left out for v1.
+
+Counts are raw rows, so one visit can count more than once: as a claim line and as an encounter, or as several claim lines. A count reflects how much activity a code generated, not how many separate visits it took.
+
+Result: counts score about the same as presence. Val AUC differs by −0.005 to +0.006 across the 8 lookbacks, within noise. Counts are kept as the default because they carry strictly more information.
 
 ### F2. Both sources, any status
 Codes come from claims (ICD10CM, CPT, HCPCS, NDC) and encounters (ICD10CM, CPT). A code present in either source sets the same column. All claim statuses (paid, denied and so on) and all encounter statuses count: a denied claim or a cancelled event still shows clinical intent. `sources` can restrict this to one source. Rows with a missing code are dropped.
@@ -98,7 +102,13 @@ The vocabulary is written next to the features as `<features file>_vocabulary.cs
 At a 4-quarter lookback this keeps 112 of the 114 codes seen. It drops `ICD10CM_Z68.42` (0 train patients, 2 holdout) and `ICD10CM_Z68.20` (under 11 train patients). The rarest kept feature is `ICD10CM_Z68.39`, with 11 train patients.
 
 ### F5. File names follow the splits file
-`features_onehot_<splits params>_<ignore tag>_mintrain<n>.csv`, for example `features_onehot_lookback4q_neg1x_seed0_excl-surgery_mintrain11.csv`. The ignore tag is `excl-surgery` (default), `excl-none`, or `excl-<n>codes-<hash>` for a custom list. The script also writes `<features file>_coverage.csv` and `<features file>_vocabulary.csv`.
+`features_<encoding>[_minmax]_<splits params>_<ignore tag>_mintrain<n>[_demo].csv`, for example `features_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo.csv`.
+- The encoding is `count` or `onehot`.
+- `_minmax` marks scaled features.
+- The ignore tag is `excl-surgery` (default), `excl-none`, or `excl-<n>codes-<hash>` for a custom list.
+- `_demo` marks that age and sex are included.
+
+The script also writes `_vocabulary.csv`, `_scaling.csv`, `_coverage.csv` and `_summary.csv` next to the features. Training run folders take the same name with `features_` replaced by `logreg_`.
 
 ### F6. Coverage report
 `feature_coverage()` gives, per feature, the percentage of patients with it in each of train/val/test/holdout, plus a `missing_in_train` flag for features seen elsewhere but never in train. `coverage_summary()` gives, per split, patients, features present, mean codes per patient, and the share of patients with no codes.
@@ -106,6 +116,30 @@ At a 4-quarter lookback this keeps 112 of the 114 codes seen. It drops `ICD10CM_
 `features_present` in the summary counts the columns with at least one patient = 1 in that split. It is not the number of columns, which is the same for every split.
 
 At a 4-quarter lookback, after the train vocabulary filter, there are 112 features. Coverage is similar across splits: about 17 codes per patient, and under 1% of patients with no codes. No feature is missing in train, and train prevalence ranges from 0.3% to 45%.
+
+### F7. Min-max scaling fitted on train only
+The code-count columns and `age` are scaled to `(x − min) / (max − min)`, using each column's min and max over **train rows only**. The same transform is then applied unchanged to val, test and holdout, so nothing about their distribution leaks into training. The sex columns are already 0/1 and are left alone. A column that is constant in train is only shifted.
+
+Values outside train's range are not clipped, so val, test and holdout can fall below 0 or above 1. Clipping would hide real extremes; for example, the largest out-of-range value is 3.0, a patient with three times the train maximum count. The fitted min and max are saved as `<features file>_scaling.csv`, so scoring can apply them with `apply_minmax(features, read_scaling(path))` without refitting.
+
+Coverage and summary reports are computed before scaling, from presence (value > 0).
+
+### F8. Demographics: age and sex
+`age = 2026 − birth_year` and one-hot `sex_F`, `sex_M`, `sex_U` come from the patients table and sit right after the ID columns. They are always kept, whatever the train vocabulary filter. A blank sex (143 patients) leaves all three sex columns 0. A patient missing from the patients table would get the table's median age; none are missing in this extract.
+
+Adding them raised val AUC by 0.003–0.011 at every lookback, mostly through age: older patients have surgery less often. The sex weights are unstable.
+
+**Known data issues, not yet handled:** 63 patients have `birth_year = 1900`, which looks like a placeholder for unknown (age 126). 4,367 patients have `birth_year = 1961`, about 4 times the neighbouring years, with only about 210 a year after 1961. That looks like a default or cap. The proposed fix is to treat 1900 as missing with an `age_missing` flag, and add a `birth_year_1961` flag.
+
+### F9. Provider-specialty counts from claims
+There is one column per `provider_specialty` listed in the data dictionary, all 15, named `specialty_<name>` (e.g. `specialty_orthopedic_surgery`). Each counts the patient's claim lines in the window from a provider of that specialty, whatever the code. Lines with no code still count, and lines with an ignored code (surgery) don't. The columns are min-max scaled on train like the code counts, and always kept regardless of the train vocabulary filter, so the column set is stable across extracts. Pharmacy (NDC) lines have no specialty and don't count. Six documented specialties never appear in this extract (Neurosurgery, Rheumatology, Anesthesiology, Cardiology, Nephrology, Endocrinology), so their columns are all zero. File names gain `_spec`; `--no-specialties` turns the columns off.
+
+Result, XGBoost only (val AUC before → after):
+- **Surgery:** +0.001 to +0.009 across the 8 lookbacks. The 12-quarter lookback is still best at 0.727, tied with 10 quarters.
+- **PT enrollment:** 0.659 → 0.658.
+- **WM enrollment:** 0.643 → 0.648.
+
+Every change is well within val noise (about ±0.02). Specialty mostly restates what the codes already say. The exception is WM enrollment, where `specialty_physical_therapy` becomes the single most important feature. It packs the PT-engagement signal that was spread across several CPT codes into one column (see E8).
 
 ## Training
 
@@ -130,6 +164,87 @@ First run (4-quarter lookback, `mintrain11`): val ROC AUC 0.708, average precisi
 
 ### T4. Predicted probabilities are for the 1:1 sampled population
 Train and val are about 50% positive because negatives are sampled 1:1 with positives. In the real population surgery is far rarer, so the model's probabilities are far too high in absolute terms, even though the ranking is unaffected. Before using scores as real risk, they need a prior correction for the true prevalence, or recalibration on a sample with the true base rate.
+
+### T5. XGBoost as a second model, fixed settings
+`train(..., model="xgboost")` (or `--model xgboost`) fits gradient-boosted trees on the same features, with the same train/val handling and report. Settings are fixed, not tuned: 300 trees, depth 3, learning rate 0.05, 80% row and column subsampling, `min_child_weight` 5, seed 0, single thread for reproducibility. The report lists feature gain importance instead of coefficients. Min-max scaling has no effect on trees, so the same feature files are used.
+
+`xgboost` is pinned to 3.0.5. Version 3.4.1 needs a newer OpenMP runtime than the `libomp` 18 installed here, and won't load on this Mac.
+
+**Result** (count + min-max + demographics features, val):
+
+| quarters | 1 | 2 | 3 | 4 | 6 | 8 | 10 | 12 |
+|---|---|---|---|---|---|---|---|---|
+| logreg val AUC | 0.679 | 0.700 | 0.712 | 0.717 | 0.695 | 0.694 | 0.690 | 0.692 |
+| xgboost val AUC | 0.690 | 0.708 | 0.720 | 0.721 | 0.713 | 0.717 | 0.722 | 0.726 |
+
+XGBoost is ahead at every lookback, and the gap grows with history length, from +0.004 at 4 quarters to +0.034 at 12. With logreg, longer windows got worse; with XGBoost they don't, which suggests the extra history holds non-linear signal that logreg can't use. It also overfits more: train AUC is about 0.84 against val 0.72, compared with 0.75 against 0.70 for logreg. Each single comparison is within the noise of the 796-patient val set (about ±0.02), but the direction is consistent across all 8 lookbacks. Both models rank the surgical consult codes (99204, 99244) highest.
+
+## Program enrollment (PT, WM)
+
+Implemented in [`assignment/labels.py`](assignment/labels.py), with `labels_file=` in `assignment/train.py`. Tested in [`tests/test_labels.py`](tests/test_labels.py) and `tests/test_train.py`.
+
+### E1. Multi-label, modelled as two binary tasks
+1,773 of the 10,042 enrolled patients (18%) enrolled in both PT and WM, and 67% of WM enrollees also did PT. So the outcome is multi-label, not multi-class. Both enrollments rarely happen together: the median gap is 193 days, and only 22 patients started both within 90 days.
+
+We train one binary model per program on the same features rather than a single multi-label model. XGBoost's multi-label mode builds independent trees per label anyway, and separate tasks allow per-program exclusions, metrics and calibration. The program to recommend can then be chosen by comparing the two scores.
+
+### E2. Same splits and features; tasks supply their own labels
+Splits and features are unchanged. The same patients, splits, index dates, windows, feature vocabulary and train-fitted scaling are reused, and nothing in them depends on labels. `assignment.labels` writes a `labels_<task>_<splits params>.csv` (`patient_token, label`), and `train(..., labels_file=...)` swaps it in for the surgery label. Train/val patients without a label for that task are dropped and counted in the report under `excluded_unlabelled`. Test and holdout are still never read. Run names get the task prefix, e.g. `xgboost_enroll-PT_h4q_count_minmax_lookback4q_...`. Any future task can plug in the same way.
+
+### E3. Label: new enrollment within `horizon_quarters` from the index date
+- **Label 1:** an enrollment in the program dated in `[index_date, index_date + N quarters)`. The feature window ends the day before the index date, so features never overlap the outcome period.
+- **Excluded (no label):**
+  - **prior enrollees:** patients enrolled in *that* program at any time before the index date. The task is new enrollment, and their PT/WM session codes would give the answer away. A prior PT enrollment does not exclude a patient from the WM task.
+  - **censored follow-up:** the horizon runs past the extract end (2026-06-30), so a 0 might be an enrollment we can't see yet.
+  - **holdout:** no outcome to learn from.
+- `horizon_quarters` defaults to 4.
+
+| task (4-quarter lookback) | train labelled / positives | val labelled / positives | val positive rate |
+|---|---|---|---|
+| PT, 4 quarters | 2,068 / 352 | 441 / 82 | 18.6% |
+| PT, 1 quarter | 2,830 / 141 | 597 / 42 | 7.0% |
+| WM, 4 quarters | 2,463 / 133 | 533 / 38 | 7.1% |
+| WM, 1 quarter | 3,363 / 53 | 721 / 9 | 1.2% |
+
+**1-quarter horizons are too thin to use.** WM has 9 val positives, and PT and WM 1-quarter val AUCs are 0.53–0.67. The 4-quarter horizon is the working choice, even though the outreach decision is for next quarter.
+
+### E4. First results (val, 4-quarter lookback, 4-quarter horizon)
+| | logreg AUC | xgboost AUC | logreg lift in top 10% |
+|---|---|---|---|
+| PT | 0.715 | 0.690 | 2.7 |
+| WM | 0.707 | 0.704 | 1.9 (xgboost 2.4) |
+
+With these small labelled sets, XGBoost overfits badly (train AUC 0.88–0.92) and does no better than logreg, the reverse of the surgery task.
+
+### E5. Known issues with reusing the surgery splits for enrollment
+- **Post-surgery rehab.** Half the cohort's index date is their surgery date, so their outcome window is right after surgery. Surgery patients enroll in PT within 4 quarters at 22% against 13% for others, and in WM at 8.5% against 3.4%. Part of what the PT model learns is post-operative rehab, not conservative care before surgery, which is Meridian's goal. The surgical consult codes (99204, 99244) are among the top PT features.
+- **Censoring removes recent index dates.** With a 4-quarter horizon, 1,211 PT and 1,460 WM patients are dropped for censoring, which shifts the labelled set toward earlier index dates.
+- **Cross-program signal.** WM's top features are PT therapy codes (97530, 97140, 97110), and PT's include nutrition therapy (97802, 97803). That fits the overlap in E1: engagement in one program predicts the other.
+- **Enrollment isn't outreach response.** 42% of enrolled patients were never contacted, so these models predict enrollment from any source, not the effect of outreach.
+
+### E6. Reworked: an enrollment cohort per program (replaces E2–E5 for modelling)
+The labels-on-surgery-splits approach (E2–E5) mostly predicted post-surgery enrollment, because the surgery-patient label windows started at surgery. It's kept in the code but superseded by a cohort built for enrollment: [`assignment/enrollment_splits.py`](assignment/enrollment_splits.py), tested in [`tests/test_enrollment_splits.py`](tests/test_enrollment_splits.py). It writes the standard splits format, so features and training run on it unchanged.
+
+- **Positives:** patients whose **first** enrollment in the program came before their first surgery-code date, or who never had surgery. Index date = that first enrollment. Patients who first enrolled after surgery (413 PT, 217 WM) are left out.
+- **Negatives:** patients contacted for that program whose attempt ended in a refusal (**Declined, Opted Out, Unsubscribed**), who never enrolled in it, and whose first refusal came before any surgery. Index date = first refusal. Other results such as voicemail or no answer don't count: we can't tell whether those patients ever got the message.
+- **Window:** the `lookback_quarters` quarters before the index date, ending the day before, as everywhere else. Positives' features therefore stop before their first enrollment, so their own program's session codes can't leak in.
+- **Splits and holdout:** the same token buckets and holdout rules as the surgery splits (shared `finish_splits()` in `splits.py`). Each program has its own file: `patient_windows_enroll-<PT|WM>_lookback<X>q.csv`.
+
+### E7. Positives limited to the outreach period (`match_period=True`)
+Negatives only exist while outreach ran (index dates 2024-07 to 2026-02), but enrollments span the whole extract. Without a limit, 31% of PT positives and 20% of WM positives had lookback windows cut off by the extract start, against 0% of negatives. The index date alone then separated the classes with AUC 0.67 (PT). Keeping positives to the negatives' index-date range removes the truncation, with 0% in both classes, and brings the date-only AUC down to 0.57 (PT) and 0.51 (WM). Val AUC without matching was higher (PT 0.683 against 0.655); part of that difference was the timing shortcut, so matched is the honest number. `match_period=False` is still available (files tagged `_allperiod`).
+
+Some timing difference remains for PT (date-only AUC 0.57). Matching the date distributions exactly, as done for surgery negatives, would remove it.
+
+### E8. Results (4-quarter lookback, matched period, val)
+| | train pos / neg | val pos / neg | logreg val AUC | xgboost val AUC | val AP (base rate) | lift in top 10% |
+|---|---|---|---|---|---|---|
+| PT | 3,713 / 803 | 820 / 184 | 0.655 | 0.659 | 0.899 (0.817) | 1.2 |
+| WM | 1,148 / 422 | 264 / 91 | 0.665 | 0.643 | 0.856 (0.744) | 1.2–1.3 |
+
+- **The cohort is mostly positives** (74–82% in val), because refusals are rare. Average precision looks high only because of that base rate; lift in the top 10% is about 1.2. AUC is the fairer comparison.
+- **Models:** logreg and XGBoost are similar. XGBoost overfits more (train AUC 0.80–0.90). Calibration is close (mean decile gap 0.03–0.04 for logreg).
+- **The top features describe engagement across programs.** PT enrollment, as opposed to refusing PT, is predicted by WM-type activity: nutrition therapy 97802/97803, obesity counselling G0447, BMI Z68.3x, obesity E66.9. WM enrollment is predicted by PT therapy codes (97140, 97530). Older age raises the odds of enrolling in both.
+- **Negatives come from outreach, positives from any source.** Positives include patients who enrolled without being contacted. The model separates "enrolls" from "refuses when asked", which is closer to the outreach decision than E3 was, but it's still not the effect of outreach.
 
 ## Known limitations / open questions
 

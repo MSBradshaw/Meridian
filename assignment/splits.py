@@ -183,8 +183,27 @@ def build_splits(
     pos = _window(positives, first_surgery, lookback_quarters).assign(label=1)
     neg = _window(neg_index.index, neg_index, lookback_quarters).assign(label=0)
     labelled = pd.concat([pos, neg], ignore_index=True)
-    labelled["split"] = labelled["patient_token"].map(assign_split)
+    return finish_splits(
+        labelled, patients, events, any_surgery, lookback_quarters, holdout_recent_quarters, extract_end
+    )
 
+
+def finish_splits(
+    labelled: pd.DataFrame,
+    patients: pd.DataFrame,
+    events: pd.DataFrame,
+    any_surgery: set,
+    lookback_quarters: int,
+    holdout_recent_quarters: int = 1,
+    extract_end: pd.Timestamp = EXTRACT_END,
+) -> pd.DataFrame:
+    """Assign train/val/test to labelled windows by token, add the holdout, and return the splits table.
+
+    Holdout: patients-table patients with active coverage at the extract end, an
+    event in the last `holdout_recent_quarters` quarters, no surgery evidence and
+    not in `labelled`. Index date = the day after the extract end.
+    """
+    labelled = labelled.assign(split=labelled["patient_token"].map(assign_split))
     covered = patients[
         (patients["coverage_start"] <= extract_end)
         & (patients["coverage_end"].isna() | (patients["coverage_end"] >= extract_end))
