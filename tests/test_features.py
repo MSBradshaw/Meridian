@@ -113,14 +113,14 @@ def test_patients_outside_splits_are_dropped(features):
 
 def test_filename_tracks_splits_file_and_ignore_list():
     splits_file = "artifacts/splits/patient_windows_lookback6q_neg1x_seed0.csv"
-    assert features_filename(splits_file) == "features_count_minmax_lookback6q_neg1x_seed0_excl-surgery_mintrain11_demo_spec.csv"
-    assert features_filename(splits_file, []) == "features_count_minmax_lookback6q_neg1x_seed0_excl-none_mintrain11_demo_spec.csv"
+    assert features_filename(splits_file) == "features_count_minmax_lookback6q_neg1x_seed0_excl-surgery-consult_mintrain11_demo_spec.csv"
+    assert features_filename(splits_file, []) == "features_count_minmax_lookback6q_neg1x_seed0_excl-consult_mintrain11_demo_spec.csv"
     assert features_filename(splits_file, include_specialties=False).endswith("_mintrain11_demo.csv")
     assert features_filename(splits_file, encoding="binary", scale=False).startswith("features_onehot_lookback6q_")
-    assert features_filename(splits_file, min_train_patients=5).endswith("_excl-surgery_mintrain5_demo_spec.csv")
-    assert features_filename(splits_file, include_demographics=False).endswith("_excl-surgery_mintrain11_spec.csv")
+    assert features_filename(splits_file, min_train_patients=5).endswith("_excl-surgery-consult_mintrain5_demo_spec.csv")
+    assert features_filename(splits_file, include_demographics=False).endswith("_excl-surgery-consult_mintrain11_spec.csv")
     custom = features_filename(splits_file, [*SURGERY_CODES, "72148"])
-    assert custom.startswith("features_count_minmax_lookback6q_neg1x_seed0_excl-5codes-")
+    assert custom.startswith("features_count_minmax_lookback6q_neg1x_seed0_excl-7codes-")  # 5 + 2 forbidden
     assert ignore_tag(["72148", *SURGERY_CODES]) == ignore_tag([*SURGERY_CODES, "72148"])
 
 
@@ -147,7 +147,7 @@ def test_write_features_round_trip(tmp_path, monkeypatch):
     monkeypatch.setattr("assignment.features.load_code_events", lambda data_dir, sources: events())
     monkeypatch.setattr("assignment.features.load_demographics", lambda data_dir: demographics())
     path = write_features(4, splits_file=splits_file, out_dir=tmp_path / "features", min_train_patients=1)
-    assert path.name == "features_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain1_demo_spec.csv"
+    assert path.name == "features_count_minmax_lookback4q_neg1x_seed0_excl-surgery-consult_mintrain1_demo_spec.csv"
     written = pd.read_csv(path, dtype={"patient_token": str})
     expected = build_features(
         read_splits(splits_file), events(), min_train_patients=1, demographics=demographics(), specialties=SPECIALTIES
@@ -160,7 +160,8 @@ def test_write_features_round_trip(tmp_path, monkeypatch):
     scaling = read_scaling(sidecar_path(path, "scaling"))
     pd.testing.assert_frame_equal(scaling, fit_minmax(expected), check_dtype=False)
     scaled = apply_minmax(expected, scaling).drop(columns=["patient_token", "split", "label"]).to_numpy()
-    assert abs(written.drop(columns=["patient_token", "split", "label"]).to_numpy() - scaled).max() < 1e-5
+    # exact: models are trained on the written values and inference rebuilds them in memory
+    assert (written.drop(columns=["patient_token", "split", "label"]).to_numpy() == scaled).all()
     assert sidecar_path(path, "coverage").exists() and sidecar_path(path, "summary").exists()
     unscaled = write_features(4, splits_file=splits_file, out_dir=tmp_path / "raw", min_train_patients=1, scale=False)
     assert not sidecar_path(unscaled, "scaling").exists()
@@ -300,3 +301,15 @@ def test_specialties_are_scaled_on_train_and_not_codes():
 def test_specialties_optional():
     f = build_features(splits(), events(), min_train_patients=0)
     assert not [c for c in f.columns if c.startswith("specialty_")]
+
+
+def test_surgical_consult_codes_are_always_removed():
+    ev = pd.concat([events(), pd.DataFrame({
+        "patient_token": ["a", "b"], "date": pd.to_datetime(["2024-05-01", "2024-05-01"]),
+        "code_system": ["CPT", "CPT"], "code": ["99204", "99244"],
+    })], ignore_index=True)
+    for ignore in (SURGERY_CODES, [], ["72148"]):  # whatever the caller asks for
+        f = build_features(splits(), ev, ignore_codes=ignore, min_train_patients=0)
+        assert "CPT_99204" not in f.columns and "CPT_99244" not in f.columns
+    spec = build_features(splits(), ev.assign(provider_specialty="Orthopedic Surgery"), min_train_patients=0, specialties=SPECIALTIES)
+    assert spec.set_index("patient_token").loc["b", "specialty_orthopedic_surgery"] == 1  # the 99244 line is not counted

@@ -33,7 +33,7 @@ preceded by the task when a labels file is used (`xgboost_enroll-PT_h4q_count_..
 As a module:
 
     from assignment.train import train
-    run_dir = train("artifacts/features/features_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo.csv")
+    run_dir = train("artifacts/features/features_count_minmax_lookback4q_neg1x_seed0_excl-surgery-consult_mintrain11_demo_spec.csv")
 
 As a script:
 
@@ -51,6 +51,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 from xgboost import XGBClassifier
 
+from assignment.features import forbidden_columns
 from assignment.labels import read_labels, task_from_labels_file
 
 ID_COLUMNS = ["patient_token", "split", "label"]
@@ -80,6 +81,9 @@ def read_features(path: Path | str, labels_file: Path | str | None = None) -> pd
     missing from it get no label).
     """
     features = pd.read_csv(path, dtype={"patient_token": str, "split": str, "label": "Int8"})
+    forbidden = forbidden_columns(features.columns)
+    if forbidden:
+        raise ValueError(f"{path} has forbidden feature columns {forbidden}; rebuild it with assignment.features")
     features = features[features["split"].isin(USED_SPLITS)].reset_index(drop=True)
     if labels_file is not None:
         labels = read_labels(labels_file).set_index("patient_token")["label"]

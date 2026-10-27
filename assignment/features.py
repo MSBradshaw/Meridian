@@ -20,7 +20,8 @@ vocabulary, named `{code_system}_{code}` (e.g. `CPT_72148`, `ICD10CM_M54.50`,
                any claim/event status. A code counts if it appears on a date in
                [start_date, end_date], inclusive, in either source.
     Ignored    `ignore_codes` are dropped before encoding; by default the
-               surgery codes, which define the label.
+               surgery codes, which define the label. The surgical consult
+               codes (`FORBIDDEN_FEATURE_CODES`) are always dropped too.
     Demographics  `age` (2026 - birth_year) and one-hot `sex_F/M/U` from the
                patients table, placed after the ID columns and always kept.
     Specialties  `specialty_<name>`: claim lines in the window per provider
@@ -70,6 +71,29 @@ SPECIALTY_PREFIX = "specialty_"
 def specialty_column(specialty: str) -> str:
     """`Orthopedic Surgery` -> `specialty_orthopedic_surgery`."""
     return SPECIALTY_PREFIX + specialty.lower().replace(" ", "_")
+
+# Surgical consult codes (new patient visit / office consultation, the `Surgical Consult`
+# category). Never allowed as model inputs: a patient already seeing a surgeon is past the
+# point outreach can help, and models leaning on them flag patients too late. Removed by
+# `build_features` whatever `ignore_codes` says; `assignment.train` refuses files with them.
+SURGICAL_CONSULT_CODES = ("99204", "99244")
+FORBIDDEN_FEATURE_CODES = SURGICAL_CONSULT_CODES
+
+# PT referral events in the encounters table (`PT Referral` category): PT evaluation and
+# therapeutic exercise. Ignored for the PT enrollment model, where they are PT care itself.
+PT_REFERRAL_CODES = ("97001", "97110")
+
+# Filename tags for known ignore sets; forbidden codes are always part of the effective set.
+NAMED_IGNORE_SETS = {
+    "surgery-consult": (*SURGERY_CODES, *FORBIDDEN_FEATURE_CODES),
+    "surgery-consult-ptref": (*SURGERY_CODES, *FORBIDDEN_FEATURE_CODES, *PT_REFERRAL_CODES),
+    "consult": FORBIDDEN_FEATURE_CODES,
+}
+
+
+def forbidden_columns(columns: Iterable[str]) -> list[str]:
+    """Feature columns built from a forbidden code, e.g. `CPT_99204`."""
+    return [c for c in columns if c.split("_", 1)[-1] in FORBIDDEN_FEATURE_CODES]
 
 SPLITS_DIR = Path("artifacts/splits")
 FEATURES_DIR = Path("artifacts/features")
@@ -180,7 +204,7 @@ def build_features(
     if encoding not in ENCODINGS:
         raise ValueError(f"encoding must be one of {list(ENCODINGS)}")
     windows = splits[["patient_token", "start_date", "end_date"]]
-    events = events[~events["code"].isin(set(ignore_codes))]
+    events = events[~events["code"].isin(set(ignore_codes) | set(FORBIDDEN_FEATURE_CODES))]
     in_window = events.merge(windows, on="patient_token")
     in_window = in_window[in_window["date"].between(in_window["start_date"], in_window["end_date"])]
 
@@ -244,10 +268,12 @@ def apply_minmax(features: pd.DataFrame, scaling: pd.DataFrame) -> pd.DataFrame:
 
 
 def ignore_tag(ignore_codes: Iterable[str]) -> str:
-    """Short filename tag for the ignored-code set."""
-    codes = sorted(set(ignore_codes))
-    if codes == sorted(SURGERY_CODES):
-        return "excl-surgery"
+    """Short filename tag for the effective ignored-code set (`ignore_codes` plus the
+    forbidden codes): a name for known sets, else a hash."""
+    codes = sorted(set(ignore_codes) | set(FORBIDDEN_FEATURE_CODES))
+    for name, named in NAMED_IGNORE_SETS.items():
+        if codes == sorted(set(named)):
+            return f"excl-{name}"
     if not codes:
         return "excl-none"
     digest = hashlib.sha1(",".join(codes).encode()).hexdigest()[:8]
@@ -264,7 +290,7 @@ def features_filename(
     include_specialties: bool = True,
 ) -> str:
     """`patient_windows_lookback4q_neg1x_seed0.csv`
-    -> `features_count_minmax_lookback4q_neg1x_seed0_excl-surgery_mintrain11_demo_spec.csv`."""
+    -> `features_count_minmax_lookback4q_neg1x_seed0_excl-surgery-consult_mintrain11_demo_spec.csv`."""
     stem = Path(splits_file).stem.removeprefix("patient_windows_")
     kind = ENCODINGS[encoding] + ("_minmax" if scale else "")
     extras = ("_demo" if include_demographics else "") + ("_spec" if include_specialties else "")
@@ -347,7 +373,9 @@ def write_features(
         scaling = fit_minmax(features)
         scaling.to_csv(sidecar_path(path, "scaling"))
         features = apply_minmax(features, scaling)
-    features.to_csv(path, index=False, float_format="%.6g")
+    # Full precision: models are trained on these values and inference rebuilds them
+    # exactly; rounding here shifts values across tree split points at scoring time.
+    features.to_csv(path, index=False)
     return path
 
 

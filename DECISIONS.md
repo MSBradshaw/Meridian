@@ -141,6 +141,23 @@ Result, XGBoost only (val AUC before → after):
 
 Every change is well within val noise (about ±0.02). Specialty mostly restates what the codes already say. The exception is WM enrollment, where `specialty_physical_therapy` becomes the single most important feature. It packs the PT-engagement signal that was spread across several CPT codes into one column (see E8).
 
+### F10. Surgical consult codes are forbidden in every model
+99204 and 99244, the `Surgical Consult` codes, are never model inputs. They're listed in `features.FORBIDDEN_FEATURE_CODES` and removed by `build_features` whatever `ignore_codes` says, from code columns and from specialty counts alike. `train.py` refuses any features file that contains them, so older files can't be trained on by mistake. File tags reflect the effective set: `excl-surgery-consult`, `excl-surgery-consult-ptref` (PT), or `excl-consult`.
+
+**Why:** they were the top two surgery features at every lookback. But a patient already seeing a surgeon is past the point where PT or WM outreach is likely to help, and a model leaning on consults flags patients late. Part J of the EDA shows outreach is already late: only 25% of eventual surgery patients were contacted before surgery, at a median of 141 days ahead.
+
+**Effect** (XGBoost, val AUC with consults → without):
+- **Surgery:**
+
+  | lookback | 1 | 2 | 3 | 4 | 6 | 8 | 10 | 12 |
+  |---|---|---|---|---|---|---|---|---|
+  | with consults | 0.699 | 0.711 | 0.723 | 0.722 | 0.721 | 0.722 | 0.727 | 0.727 |
+  | without | 0.696 | 0.704 | **0.708** | 0.686 | 0.685 | 0.688 | 0.687 | 0.688 |
+
+  Short lookbacks lose little (−0.004 to −0.015). Lookbacks of 4 quarters or more lose about 0.035–0.040, so 3 quarters is now the best lookback. The consult signal was concentrated in longer windows. The top features are now pharmacy NDCs, lumbar X-ray (72100) and PT activity (97110, 97001).
+- **PT enrollment:** 0.636 → 0.625.
+- **WM enrollment:** 0.648 → 0.668. Both are within noise.
+
 ## Training
 
 Implemented in [`assignment/train.py`](assignment/train.py) and tested in
@@ -178,6 +195,62 @@ Train and val are about 50% positive because negatives are sampled 1:1 with posi
 | xgboost val AUC | 0.690 | 0.708 | 0.720 | 0.721 | 0.713 | 0.717 | 0.722 | 0.726 |
 
 XGBoost is ahead at every lookback, and the gap grows with history length, from +0.004 at 4 quarters to +0.034 at 12. With logreg, longer windows got worse; with XGBoost they don't, which suggests the extra history holds non-linear signal that logreg can't use. It also overfits more: train AUC is about 0.84 against val 0.72, compared with 0.75 against 0.70 for logreg. Each single comparison is within the noise of the 796-patient val set (about ±0.02), but the direction is consistent across all 8 lookbacks. Both models rank the surgical consult codes (99204, 99244) highest.
+
+### T6. `uv run main.py train`: the three models from the raw extract, plus a test evaluation
+`main.py train` calls `assignment.pipeline.train_all(data/, artifacts/)`. It needs only the five extract files, and claims may be `.csv.gz` or `.csv`. This was verified by a run in an empty directory with just those files, with claims gzipped; it takes about 70 seconds on CPU. For each task it builds splits, features and an XGBoost model with the agreed defaults, then scores val and **test**:
+
+| task | splits | ignored codes (plus consults, always) |
+|---|---|---|
+| surgery | `splits.py`, 4-quarter lookback | surgery codes |
+| enroll-PT | `enrollment_splits.py`, no prior PT care | surgery + PT referral codes |
+| enroll-WM | `enrollment_splits.py` | surgery codes |
+
+The test split is read only in `assignment.evaluate`, once per trained model, after training is finished. It writes `metrics_test.json`, `calibration_test.csv` and `predictions_test.csv` into the model's run folder. `artifacts/manifest.json` records each task's splits, features, vocabulary, scaling and model paths, for the scoring step. `artifacts/training_summary.csv` holds the val and test metrics.
+
+First test results, alongside val:
+
+| task | val AUC | **test AUC** | test AP (base rate) | test lift in top 10% |
+|---|---|---|---|---|
+| surgery | 0.686 | **0.721** | 0.711 (0.49) | 1.73 |
+| enroll-PT | 0.625 | **0.621** | 0.897 (0.83) | 1.15 |
+| enroll-WM | 0.668 | **0.666** | 0.834 (0.72) | 1.23 |
+
+Test agrees with val within noise. Surgery test is 0.035 higher than val, which is still within the ±0.02–0.03 uncertainty of ~750-patient sets. So there is no sign that choosing settings on val overfit them.
+
+## Inference
+
+Implemented in [`assignment/inference.py`](assignment/inference.py), run by `uv run main.py score`, tested in [`tests/test_inference.py`](tests/test_inference.py).
+
+### I1. Holdout → surgery model → PT/WM models → rules → list ordered by surgery score
+1. **Population:** the surgery splits' holdout, 17,295 patients. These are patients-table patients with active coverage, data in the last quarter and no surgery evidence. Index date is 2026-07-01, and the window is the 4 quarters before it.
+2. **Surgery model** scores everyone. A patient is positive if the score is **≥ 0.5**, the natural cutoff for a model trained on a 50/50 sample.
+3. **PT and WM models** score only the surgery positives. A patient is positive for a program if their score is **at least that model's training positive rate** (PT 0.82, WM 0.73), meaning more likely than the average training patient to enroll rather than refuse. The models were trained on mostly-enroller cohorts, so 0.5 would make almost everyone positive.
+4. **Rules**, for anyone positive for PT and/or WM:
+   - coverage active at the extract end;
+   - no surgery evidence (any surgery code, or a `Spine Surgery` encounter, any status);
+   - PT dropped if already enrolled in PT *or* with PT-specialty claims before the index date (prior PT care, which the PT model's cohort excludes, see E9);
+   - WM dropped if already enrolled in WM.
+
+   Patients left with no program are removed. Coverage and surgery are already guaranteed by the holdout definition but are checked again explicitly.
+5. **Output:** `out/targets.csv` with `patient_token, program_recommended, score`. `program_recommended` is `PT`, `WM` or `PT+WM`; `score` is the surgery score. Rows are ordered by score, highest first. `out/targets_detail.csv` adds every model score, threshold, positive flag and rule outcome for every holdout patient, and `main.py score` prints the funnel.
+
+Features are **rebuilt from the raw extract** for each model, using its saved vocabulary, ignored codes and train scaling, rather than read back from the training files. That way the same code can score a newer extract. A check confirms the rebuilt scores equal scores on the training-time holdout rows to within 3×10⁻⁸.
+
+### I2. Feature files are written at full precision
+Feature files used to be written rounded to 6 significant digits. The models were trained on those rounded values, while inference rebuilds unrounded values in memory. Values such as 1/3 then fell on the other side of XGBoost split points, and holdout scores differed by up to **0.26**. Files are now written at full precision, which leaves val/test metrics unchanged to 3 decimals. A test now requires the written features to equal the in-memory ones exactly.
+
+### I3. First list (thresholds as above)
+| step | patients |
+|---|---|
+| holdout scored | 17,295 |
+| surgery positive (≥ 0.5) | 6,755 |
+| PT positive / WM positive | 2,920 / 3,107 |
+| PT or WM positive | 4,384 |
+| PT removed: already enrolled in PT / prior PT care | 1,188 / 1,833 |
+| WM removed: already enrolled in WM | 393 |
+| **on the list** | **3,407**: WM only 2,343, PT only 693, both 371 |
+
+The list leans heavily to WM, because the PT rules remove most PT positives: the people the PT model likes are often already in PT care. How far down the list to go is not yet decided. 6,755 surgery positives is far more than the real surgery rate (8.7%) implies, because 0.5 on a 50/50-trained model is not a calibrated real-world risk.
 
 ## Program enrollment (PT, WM)
 
@@ -245,6 +318,40 @@ Some timing difference remains for PT (date-only AUC 0.57). Matching the date di
 - **Models:** logreg and XGBoost are similar. XGBoost overfits more (train AUC 0.80–0.90). Calibration is close (mean decile gap 0.03–0.04 for logreg).
 - **The top features describe engagement across programs.** PT enrollment, as opposed to refusing PT, is predicted by WM-type activity: nutrition therapy 97802/97803, obesity counselling G0447, BMI Z68.3x, obesity E66.9. WM enrollment is predicted by PT therapy codes (97140, 97530). Older age raises the odds of enrolling in both.
 - **Negatives come from outreach, positives from any source.** Positives include patients who enrolled without being contacted. The model separates "enrolls" from "refuses when asked", which is closer to the outreach decision than E3 was, but it's still not the effect of outreach.
+
+### E9. PT cohort excludes patients already receiving physical therapy
+`exclude_prior_specialties` in `enrollment_splits.py` drops anyone, holdout included, with a claim line from a listed provider specialty dated **before their index date**. The default is `("Physical Therapy",)` for PT and nothing for WM. Files are tagged, e.g. `patient_windows_enroll-PT_noprior-physical_therapy_lookback4q.csv`.
+
+**Why:**
+- All Physical Therapy-specialty claim lines carry the PT therapy codes (97530, 97140, 97110), so they look like PT program delivery.
+- A patient with prior PT claims may already be in PT care. Meridian wouldn't market PT to them, and the model was partly learning "already in PT", which isn't a useful prediction.
+- "Before the index date" is the right cut. Excluding PT claims at *any* time removes 87% of the cohort and nearly every positive, because enrollees' own sessions appear as PT claims after they enroll.
+
+Prior PT is **not** excluded from WM, where it's real cross-program engagement, or from surgery, where it's a legitimate risk signal.
+
+**Effect** (4-quarter lookback, XGBoost):
+
+| | before | after |
+|---|---|---|
+| train pos / neg | 3,713 / 803 | 3,004 / 660 |
+| val pos / neg | 820 / 184 | 653 / 161 |
+| holdout | 14,595 | 8,813 |
+| val AUC | 0.658 | 0.627 |
+| val AP (base rate) | 0.899 (0.817) | 0.873 (0.802) |
+| lift in top 10% | 1.18 | 1.17 |
+
+- `specialty_physical_therapy` is now all zero in train and unused.
+- The top PT features are now weight-management and general-engagement signals: obesity counselling G0447, age, nutrition therapy 97802/97803, psychotherapy 90834/90837, `specialty_other` and `specialty_behavioral_health`.
+- Encounter-side PT *referral* codes (97110 at rank 47, 97001 at rank 59) remain. They come from the `PT Referral` event category and are a legitimate step before enrollment.
+- The lower AUC is the more honest number: the model no longer gets credit for spotting people already in PT.
+- **The PT holdout shrinks by 40%.** 5,782 otherwise-eligible patients have had PT claims and are no longer PT prospects. That's a business-relevant finding in itself.
+
+### E10. PT referral codes also removed from the PT model's features
+The PT model's features also ignore the PT referral codes **97001** (PT evaluation) and **97110** (therapeutic exercise). These appear only as `PT Referral` events in encounters; in claims, 97110 is billed only by PT providers. `DEFAULT_IGNORE_CODES["PT"]` in `enrollment_splits.py` is the surgery codes plus these two, and is passed as `ignore_codes` to `write_features`. The files are tagged `excl-surgery-ptref`, a named set in `features.NAMED_IGNORE_SETS`. WM keeps the surgery-only default.
+
+With E9 excluding PT-specialty patients, **no PT code reaches the PT model at all**. 97140 and 97530 are billed only by PT providers, so they were already zero.
+
+Effect (XGBoost, 4-quarter lookback): val AUC 0.627 → 0.636, AP 0.873 → 0.877, lift in top 10% 1.17 → 1.15. That's unchanged within noise: the referral codes carried little once prior PT patients were gone. The top features are age, obesity counselling (G0447), nutrition therapy (97802/97803), `specialty_other`, BMI Z68.32, `specialty_chiropractic`, an office visit (99215), psychotherapy (90837) and HbA1c (83036). It's a general-engagement and metabolic-health profile.
 
 ## Known limitations / open questions
 

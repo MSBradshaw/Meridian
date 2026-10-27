@@ -81,7 +81,7 @@ def load_tables(data_dir: Path = Path("data")) -> dict[str, pd.DataFrame]:
         ),
         "claims": pd.read_csv(
             claims_path(data_dir),
-            usecols=["patient_token", "service_date", "code_system", "code"],
+            usecols=["patient_token", "service_date", "code_system", "code", "provider_specialty"],
             dtype=str,
             parse_dates=["service_date"],
         ),

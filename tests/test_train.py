@@ -168,3 +168,8 @@ def test_labels_file_replaces_label_and_drops_unlabelled(tmp_path, model):
 def test_surgery_task_is_the_default(tmp_path):
     report = json.loads((train(write(features(), tmp_path), out_dir=tmp_path) / "metrics_val.json").read_text())
     assert report["task"] == "surgery" and report["labels_file"] is None and report["excluded_unlabelled"] == {}
+
+
+def test_training_refuses_forbidden_feature_columns(tmp_path):
+    with pytest.raises(ValueError, match="forbidden feature columns"):
+        train(write(features().assign(CPT_99204=0), tmp_path), out_dir=tmp_path)
