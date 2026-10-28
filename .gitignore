@@ -16,3 +16,7 @@ internal/
 artifacts/
 
 .DS_Store
+
+# Client extract (not for the public repo)
+data/
+data.zip
