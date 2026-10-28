@@ -31,11 +31,11 @@ vocabulary, named `{code_system}_{code}` (e.g. `CPT_72148`, `ICD10CM_M54.50`,
 As a module:
 
     from assignment.features import write_features, feature_coverage
-    path = write_features(lookback_quarters=4)
+    path = write_features(gap_quarters=4)
 
 As a script (builds the splits file first if it does not exist):
 
-    uv run python -m assignment.features --lookback-quarters 4
+    uv run python -m assignment.features --gap-quarters 4
 """
 
 import argparse
@@ -55,6 +55,8 @@ MIN_TRAIN_PATIENTS = 11  # keep features more than 10 train patients have
 ENCODINGS = {"count": "count", "binary": "onehot"}  # encoding -> filename tag
 
 AGE_REFERENCE_YEAR = 2026
+# Ages above this are not plausible: birth_year 1900 (age 126) is a placeholder for unknown.
+MAX_PLAUSIBLE_AGE = 100
 SEX_CATEGORIES = ("F", "M", "U")
 DEMOGRAPHIC_COLUMNS = ["age", *(f"sex_{s}" for s in SEX_CATEGORIES)]
 
@@ -140,13 +142,18 @@ def load_demographics(data_dir: Path = Path("data")) -> pd.DataFrame:
 def demographic_features(splits: pd.DataFrame, demographics: pd.DataFrame) -> pd.DataFrame:
     """`age` and one-hot `sex_F/M/U`, one row per patient in `splits` order.
 
-    age = AGE_REFERENCE_YEAR - birth_year. Patients without a birth year (e.g.
-    claims-only patients) get the median age of the demographics table, which
-    uses no labels. A missing or unknown-category sex leaves all sex columns 0.
+    age = AGE_REFERENCE_YEAR - birth_year. A birth year giving an age over
+    MAX_PLAUSIBLE_AGE (e.g. the 1900 placeholder), or no birth year at all (e.g.
+    claims-only patients), is replaced by the median plausible birth year of the
+    demographics table, which uses no labels. A missing or unknown-category sex
+    leaves all sex columns 0.
     """
+    plausible = demographics["birth_year"].where(AGE_REFERENCE_YEAR - demographics["birth_year"] <= MAX_PLAUSIBLE_AGE)
+    median_birth_year = float(plausible.median())
     demo = splits[["patient_token"]].merge(demographics, on="patient_token", how="left")
-    age = (AGE_REFERENCE_YEAR - demo["birth_year"]).astype("Float64")
-    age = age.fillna(float((AGE_REFERENCE_YEAR - demographics["birth_year"]).median()))
+    birth_year = demo["birth_year"].astype("Float64")
+    birth_year = birth_year.where(AGE_REFERENCE_YEAR - birth_year <= MAX_PLAUSIBLE_AGE).fillna(median_birth_year)
+    age = AGE_REFERENCE_YEAR - birth_year
     out = pd.DataFrame({"age": age.astype(float).to_numpy()})
     for s in SEX_CATEGORIES:
         out[f"sex_{s}"] = (demo["sex"] == s).fillna(False).astype("int8").to_numpy()
@@ -323,7 +330,7 @@ def read_splits(path: Path | str) -> pd.DataFrame:
 
 
 def write_features(
-    lookback_quarters: int,
+    gap_quarters: int,
     splits_file: Path | None = None,
     data_dir: Path = Path("data"),
     out_dir: Path = FEATURES_DIR,
@@ -337,8 +344,9 @@ def write_features(
 ) -> Path:
     """Build the feature table for a splits file and write it to `out_dir`; returns its path.
 
-    `splits_file` defaults to the default-parameter splits file for `lookback_quarters`,
-    which is generated if it does not exist yet. Written next to the features:
+    `splits_file` defaults to the default-parameter surgery splits file for
+    `gap_quarters` (see `assignment.splits`), which is generated if it does not
+    exist yet; `gap_quarters` is not used otherwise. Written next to the features:
 
         _vocabulary.csv  feature, train_patients (patients with the code in train)
         _scaling.csv     feature, min, max fitted on train (if `scale`)
@@ -346,9 +354,9 @@ def write_features(
         _summary.csv     `coverage_summary` of the unscaled features
     """
     if splits_file is None:
-        splits_file = SPLITS_DIR / splits_filename(lookback_quarters)
+        splits_file = SPLITS_DIR / splits_filename(gap_quarters)
         if not splits_file.exists():
-            splits_file = write_splits(lookback_quarters, data_dir=data_dir, out_dir=SPLITS_DIR)
+            splits_file = write_splits(gap_quarters, data_dir=data_dir, out_dir=SPLITS_DIR)
     ignore_codes = list(ignore_codes)
     features = build_features(
         read_splits(splits_file),
@@ -423,8 +431,8 @@ def coverage_summary(features: pd.DataFrame) -> pd.DataFrame:
 
 def cli() -> None:
     parser = argparse.ArgumentParser(description="Build code-count features for a splits file.")
-    parser.add_argument("--lookback-quarters", type=int, required=True)
-    parser.add_argument("--splits-file", type=Path, help="defaults to the default splits file for the lookback")
+    parser.add_argument("--gap-quarters", type=int, required=True)
+    parser.add_argument("--splits-file", type=Path, help="defaults to the default surgery splits file for the gap")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--out-dir", type=Path, default=FEATURES_DIR)
     parser.add_argument(
@@ -444,7 +452,7 @@ def cli() -> None:
     args = parser.parse_args()
 
     path = write_features(
-        args.lookback_quarters,
+        args.gap_quarters,
         args.splits_file,
         args.data_dir,
         args.out_dir,

@@ -198,7 +198,7 @@ def test_apply_minmax_maps_train_to_unit_range_and_does_not_clip_others():
 def test_demographic_features():
     demo = demographic_features(splits(), demographics())
     assert list(demo.columns) == DEMOGRAPHIC_COLUMNS
-    assert list(demo.age) == [76.0, 66.0, 71.0, 86.0]  # c imputed with the table median (1955 -> 71)
+    assert list(demo.age) == [76.0, 66.0, 71.0, 86.0]  # c imputed with the median plausible birth year (1955 -> 71)
     assert list(demo.sex_F) == [1, 0, 0, 0]
     assert list(demo.sex_M) == [0, 1, 0, 0]
     assert demo.loc[2:3, ["sex_F", "sex_M", "sex_U"]].sum().sum() == 0  # missing patient / blank sex
@@ -313,3 +313,13 @@ def test_surgical_consult_codes_are_always_removed():
         assert "CPT_99204" not in f.columns and "CPT_99244" not in f.columns
     spec = build_features(splits(), ev.assign(provider_specialty="Orthopedic Surgery"), min_train_patients=0, specialties=SPECIALTIES)
     assert spec.set_index("patient_token").loc["b", "specialty_orthopedic_surgery"] == 1  # the 99244 line is not counted
+
+
+def test_implausible_ages_replaced_by_median_birth_year():
+    demo_table = pd.DataFrame({
+        "patient_token": ["a", "b", "c", "d", "x"], "sex": ["F", "M", "F", "M", "U"],
+        "birth_year": pd.array([1950, 1960, 1900, 1926, 1970], dtype="Int64"),  # 1900 -> age 126; 1926 -> exactly 100
+    })
+    age = demographic_features(splits(), demo_table).age.tolist()
+    # median of the plausible birth years (1926, 1950, 1960, 1970) is 1955 -> 71; the 1900 placeholder does not count
+    assert age == [76.0, 66.0, 71.0, 100.0]

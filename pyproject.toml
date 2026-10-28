@@ -11,8 +11,18 @@ dependencies = [
     "xgboost==3.0.5",
 ]
 
+[tool.uv]
+# Notebook deps live in their own group; installed by default so `uv sync` keeps the EDA runnable.
+default-groups = ["dev", "notebook"]
+
 [dependency-groups]
 dev = ["pytest>=8"]
+notebook = [
+    "ipykernel>=7.4.0",
+    "matplotlib>=3.11.2",
+    "nbconvert>=7.17.2",
+    "nbformat>=5.11.1",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.17,<0.12.0"]

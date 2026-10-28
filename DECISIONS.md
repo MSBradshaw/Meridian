@@ -30,6 +30,8 @@ A patient is positive if any of the 4 codes appears in encounters (`event_code`)
 EDA showed that claims surgery lines are usually dated about 1 day after the matching encounters surgery. Taking the earliest date keeps the surgery itself out of the window.
 
 ### 4. The window ends the day before the index date
+> **Superseded for the surgery model by decision 11.** Surgery features now use all history up to `X` quarters *before* surgery. Enrollment cohorts still use the window below.
+
 Each row has `start_date = index_date − X quarters` and `end_date = index_date − 1 day`, both inclusive. Nothing on or after the index date (the surgery, or same-day pre-op activity) can enter the features.
 
 ### 5. Ambiguous surgery evidence is excluded everywhere
@@ -70,6 +72,31 @@ Candidates that fail the coverage or recency filter are dropped from the output 
 `write_splits(lookback_quarters, neg_ratio=1.0, seed=0)` writes
 `artifacts/splits/patient_windows_lookback{X}q_neg{ratio}x_seed{seed}.csv` with one row per patient:
 `patient_token, split, label, index_date, start_date, end_date`. `label` is 1 for positives, 0 for negatives, and blank for the holdout.
+
+### 11. Surgery window inverted: all history up to a gap of `X` quarters before surgery
+`X` used to be a lookback: the features were the `X` quarters ending the day before surgery. A model trained like that learns what a patient looks like in the months right before surgery. That flags patients who are already close to the operating table, when PT or WM can no longer help.
+
+`X` is now a **gap**, `gap_quarters`:
+- **Window:** features use **all history** (`start_date` = `HISTORY_START`, 1900-01-01) up to the day before `index_date − X quarters`. With X = 1, everything except the last quarter before surgery is used; with X = 2, everything except the last two quarters; and so on.
+- **Matching:** negatives get matched index dates as before, but only dates more than `X` quarters after their first event, so their window has data.
+- **Positives:** positives with no data before the gap are dropped. Otherwise an empty window would only ever mean "positive".
+- **Holdout:** the holdout is scored on all history up to the extract end, with **no gap**. The model learned what patients look like at least `X` quarters before surgery, so applying it to today's data flags surgery about `X` or more quarters ahead.
+- **Files:** splits files are named `patient_windows_gap{X}q_neg1x_seed0.csv`. `write_splits`, `build_splits`, `write_features` and the CLIs take `gap_quarters`. The pipeline default is `GAP_QUARTERS = 4` (one year of lead time). Enrollment models keep their 4-quarter lookback.
+
+**Sweep** (XGBoost, surgery and consult codes ignored, val):
+
+| gap X (quarters) | 1 | 2 | 3 | 4 | 6 | 8 | 10 | 12 |
+|---|---|---|---|---|---|---|---|---|
+| positives (= negatives) | 2,507 | 2,383 | 2,198 | 1,944 | 1,313 | 673 | 233 | 0 |
+| val patients | 769 | 733 | 668 | 598 | 413 | 202 | 80 | – |
+| val AUC | **0.657** | 0.601 | 0.579 | 0.581 | 0.561 | 0.457 | 0.473 | – |
+| lift in top 10% | 1.45 | 1.31 | 1.35 | 1.32 | 0.94 | 1.06 | 0.83 | – |
+
+- **Signal fades quickly with lead time.** Most of the separable signal sits in the last quarter or two before surgery.
+- **Beyond 6 quarters there is no signal** (AUC ≤ 0.5), and the extract (about 3 years) leaves too few positives with that much history. At 12 quarters there are none.
+- **For comparison:** the old window (the 4 quarters right before surgery) had val AUC 0.684. That score came largely from patients who were already months from surgery.
+
+With X = 4, `main.py train` gives surgery val AUC 0.581 and test AUC 0.571, and `main.py score` lists 3,492 patients (holdout 17,747).
 
 ## Features
 
@@ -129,7 +156,11 @@ Coverage and summary reports are computed before scaling, from presence (value >
 
 Adding them raised val AUC by 0.003–0.011 at every lookback, mostly through age: older patients have surgery less often. The sex weights are unstable.
 
-**Known data issues, not yet handled:** 63 patients have `birth_year = 1900`, which looks like a placeholder for unknown (age 126). 4,367 patients have `birth_year = 1961`, about 4 times the neighbouring years, with only about 210 a year after 1961. That looks like a default or cap. The proposed fix is to treat 1900 as missing with an `age_missing` flag, and add a `birth_year_1961` flag.
+**Implausible ages are replaced by the median birth year.** Any age over `MAX_PLAUSIBLE_AGE` (100), plus any missing birth year, gets the median *plausible* birth year of the patients table (1955, age 71). In practice that means the 63 patients with `birth_year = 1900`, a placeholder for unknown that gave age 126. Before this, those 63 set the top of the train-fitted min-max range (49–126), which squeezed every real patient into the bottom 61% of the scale. They were also treated as the oldest patients rather than as unknown. The age range is now 49–95/96.
+
+Effect after retraining: val/test AUC moved by at most 0.008 (surgery test 0.721 → 0.720; WM val 0.668 → 0.660, test 0.666 → 0.668). The holdout list went from 3,407 to 3,378 patients. Test-set enrollment comparisons are unchanged to within 0.5 points. XGBoost only uses the order of values, so the squeeze itself didn't matter; the change only affects how the 63 unknown-age patients are treated.
+
+**Still not handled:** 4,367 patients have `birth_year = 1961`, about 4 times the neighbouring years, with only about 210 a year after 1961. That looks like a default or cap. A `birth_year_1961` flag is a possible fix; ask Meridian.
 
 ### F9. Provider-specialty counts from claims
 There is one column per `provider_specialty` listed in the data dictionary, all 15, named `specialty_<name>` (e.g. `specialty_orthopedic_surgery`). Each counts the patient's claim lines in the window from a provider of that specialty, whatever the code. Lines with no code still count, and lines with an ignored code (surgery) don't. The columns are min-max scaled on train like the code counts, and always kept regardless of the train vocabulary filter, so the column set is stable across extracts. Pharmacy (NDC) lines have no specialty and don't count. Six documented specialties never appear in this extract (Neurosurgery, Rheumatology, Anesthesiology, Cardiology, Nephrology, Endocrinology), so their columns are all zero. File names gain `_spec`; `--no-specialties` turns the columns off.

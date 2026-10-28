@@ -18,11 +18,11 @@ Program enrollment (`enrollment_labels`), one binary task per program:
                  an enrollment we cannot see yet
 
     from assignment.labels import write_enrollment_labels
-    path = write_enrollment_labels(lookback_quarters=4, program="PT", horizon_quarters=4)
+    path = write_enrollment_labels(gap_quarters=4, program="PT", horizon_quarters=4)
 
 As a script (both programs):
 
-    uv run python -m assignment.labels --lookback-quarters 4 --programs PT WM --horizon-quarters 4
+    uv run python -m assignment.labels --gap-quarters 4 --programs PT WM --horizon-quarters 4
 """
 
 import argparse
@@ -102,7 +102,7 @@ def read_labels(path: Path | str) -> pd.DataFrame:
 
 
 def write_enrollment_labels(
-    lookback_quarters: int,
+    gap_quarters: int,
     program: str,
     horizon_quarters: int = 4,
     splits_file: Path | None = None,
@@ -112,12 +112,12 @@ def write_enrollment_labels(
     """Build enrollment labels for a splits file and write them to `out_dir`; returns the path.
 
     `splits_file` defaults to the default-parameter splits file for
-    `lookback_quarters`, generated if it does not exist yet.
+    `gap_quarters`, generated if it does not exist yet.
     """
     if splits_file is None:
-        splits_file = SPLITS_DIR / splits_filename(lookback_quarters)
+        splits_file = SPLITS_DIR / splits_filename(gap_quarters)
         if not splits_file.exists():
-            splits_file = write_splits(lookback_quarters, data_dir=data_dir, out_dir=SPLITS_DIR)
+            splits_file = write_splits(gap_quarters, data_dir=data_dir, out_dir=SPLITS_DIR)
     labels = enrollment_labels(read_splits(splits_file), load_enrollments(data_dir), program, horizon_quarters)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / labels_filename(splits_file, program, horizon_quarters)
@@ -142,7 +142,7 @@ def label_summary(splits: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
 
 def cli() -> None:
     parser = argparse.ArgumentParser(description="Build program-enrollment labels for a splits file.")
-    parser.add_argument("--lookback-quarters", type=int, required=True)
+    parser.add_argument("--gap-quarters", type=int, required=True)
     parser.add_argument("--programs", nargs="+", choices=PROGRAMS, default=list(PROGRAMS))
     parser.add_argument("--horizon-quarters", type=int, default=4)
     parser.add_argument("--splits-file", type=Path)
@@ -152,9 +152,9 @@ def cli() -> None:
 
     for program in args.programs:
         path = write_enrollment_labels(
-            args.lookback_quarters, program, args.horizon_quarters, args.splits_file, args.data_dir, args.out_dir
+            args.gap_quarters, program, args.horizon_quarters, args.splits_file, args.data_dir, args.out_dir
         )
-        splits_file = args.splits_file or SPLITS_DIR / splits_filename(args.lookback_quarters)
+        splits_file = args.splits_file or SPLITS_DIR / splits_filename(args.gap_quarters)
         print(f"wrote {path}")
         print(label_summary(read_splits(splits_file), read_labels(path)).to_string())
 

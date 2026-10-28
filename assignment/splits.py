@@ -2,30 +2,36 @@
 
 Each patient gets one row: which split it belongs to, its label, an index date,
 and the window of data (`start_date`..`end_date`, inclusive) that features may
-be built from. The window is the `lookback_quarters` quarters before the index
-date, ending the day before it, so nothing on or after the index date leaks in.
+be built from. The window is all of the patient's history up to `gap_quarters`
+quarters before the index date: it ends the day before `index_date - gap_quarters`
+quarters, so the model learns what a patient looks like at least `gap_quarters`
+quarters before surgery, and nothing from the gap or after it leaks in.
 
     Positives  patients with any of the surgery CPT codes (encounters or claims,
-               any status). Index date = first surgery-code date.
+               any status), with at least one event before the gap.
+               Index date = first surgery-code date.
     Negatives  no surgery evidence at all (no surgery code, no `Spine Surgery`
                encounter, any status), >= `min_history_years` of observed data.
                Sampled at random, `neg_ratio` negatives per positive.
                Index date = drawn from the positives' index dates (restricted
-               to dates inside the negative's observed data), so both classes
-               have the same calendar timing and history truncation.
+               to dates that leave an event before the gap and fall inside the
+               negative's observed data), so both classes have the same calendar
+               timing and amount of history.
     Splits     positives and sampled negatives, assigned by the last two decimal
                digits of the patient token: 0-69 train, 70-84 val, 85-99 test.
     Holdout    patients-table patients with no surgery evidence that were not
                sampled as negatives, whose coverage is active at the extract
                end and who have an event in the last `holdout_recent_quarters`
                quarters: the population to score for real.
-               Index date = the day after the extract end.
+               Index date = the day after the extract end, and no gap: it is
+               scored on all its history, to predict surgery `gap_quarters` or
+               more quarters ahead.
 
 Train/val/test may draw on patients from the patients table and the claims
 feed; the holdout is drawn from the patients table only.
 
     from assignment.splits import write_splits
-    path = write_splits(lookback_quarters=4)
+    path = write_splits(gap_quarters=4)
 """
 
 from pathlib import Path
@@ -36,6 +42,7 @@ import pandas as pd
 SURGERY_CODES = ["22630", "22633", "63030", "63047"]
 SURGERY_CATEGORY = "Spine Surgery"
 EXTRACT_END = pd.Timestamp("2026-06-30")
+HISTORY_START = pd.Timestamp("1900-01-01")  # window start meaning "all history": before any extract
 
 SPLIT_BUCKETS = {"train": (0, 70), "val": (70, 85), "test": (85, 100)}
 HOLDOUT = "holdout"
@@ -111,31 +118,42 @@ def _events(encounters: pd.DataFrame, claims: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([enc, clm], ignore_index=True).dropna(subset=["patient_token", "date"])
 
 
-def _window(tokens: pd.Index, index_dates: pd.Series, lookback_quarters: int) -> pd.DataFrame:
+def _window(
+    tokens: pd.Index, index_dates: pd.Series, lookback_quarters: int | None = None, gap_quarters: int = 0
+) -> pd.DataFrame:
+    """Data window per patient: ends the day before `index_date - gap_quarters` quarters and
+    starts `lookback_quarters` quarters before that end, or at `HISTORY_START` (all history) if None."""
     index_dates = pd.Series(index_dates.loc[tokens].to_numpy(), index=tokens)
+    cutoff = index_dates - pd.DateOffset(months=3 * gap_quarters)
+    if lookback_quarters is None:
+        start = pd.Series(HISTORY_START, index=tokens)
+    else:
+        start = cutoff - pd.DateOffset(months=3 * lookback_quarters)
     return pd.DataFrame(
         {
             "patient_token": tokens,
             "index_date": index_dates.to_numpy(),
-            "start_date": (index_dates - pd.DateOffset(months=3 * lookback_quarters)).to_numpy(),
-            "end_date": (index_dates - pd.Timedelta(days=1)).to_numpy(),
+            "start_date": start.to_numpy(),
+            "end_date": (cutoff - pd.Timedelta(days=1)).to_numpy(),
         }
     )
 
 
 def _matched_index_dates(
-    neg_pool: pd.DataFrame, positive_index: pd.Series, neg_ratio: float, seed: int
+    neg_pool: pd.DataFrame, positive_index: pd.Series, neg_ratio: float, seed: int, gap_quarters: int = 0
 ) -> pd.Series:
     """Sample negatives and give each an index date drawn from the positives' index dates.
 
     `neg_pool` has one row per candidate with its first (`min`) and last (`max`)
     observed event. A candidate can only take a positive index date that falls
-    after its first event and no later than the day after its last event, so its
-    window sits inside its own observed data. Candidates with no such date are
-    not eligible. Returns index dates keyed by patient token.
+    more than `gap_quarters` quarters after its first event (so its window has
+    data) and no later than the day after its last event, so its window sits
+    inside its own observed data. Candidates with no such date are not eligible.
+    Returns index dates keyed by patient token.
     """
     pos_dates = np.sort(positive_index.to_numpy())
-    lo = np.searchsorted(pos_dates, neg_pool["min"].to_numpy(), side="right")
+    earliest = neg_pool["min"] + pd.DateOffset(months=3 * gap_quarters)
+    lo = np.searchsorted(pos_dates, earliest.to_numpy(), side="right")
     hi = np.searchsorted(pos_dates, (neg_pool["max"] + pd.Timedelta(days=1)).to_numpy(), side="right")
     eligible = np.flatnonzero(hi > lo)
 
@@ -150,7 +168,7 @@ def build_splits(
     patients: pd.DataFrame,
     encounters: pd.DataFrame,
     claims: pd.DataFrame,
-    lookback_quarters: int,
+    gap_quarters: int,
     neg_ratio: float = 1.0,
     min_history_years: int = 2,
     seed: int = 0,
@@ -160,11 +178,13 @@ def build_splits(
     """One row per patient in train/val/test/holdout with its label and data window.
 
     `label` is 1 for positives, 0 for negatives, and missing for the holdout.
-    Patients that fit none of these (ambiguous surgery evidence, or holdout
-    candidates without active coverage or recent data) are left out.
+    Features may use all history up to `gap_quarters` quarters before the index
+    date. Patients that fit none of these (ambiguous surgery evidence, positives
+    with no data before the gap, or holdout candidates without active coverage or
+    recent data) are left out.
     """
-    if lookback_quarters < 1:
-        raise ValueError("lookback_quarters must be >= 1")
+    if gap_quarters < 1:
+        raise ValueError("gap_quarters must be >= 1")
 
     events = _events(encounters, claims)
     patient_ids = set(patients["patient_token"].dropna())
@@ -173,19 +193,19 @@ def build_splits(
     first_surgery = events[events["is_surgery_code"]].groupby("patient_token")["date"].min()
     any_surgery = set(events.loc[events["is_surgery_any"], "patient_token"])
 
-    positives = pd.Index(sorted(set(first_surgery.index) & split_pool))
-
     span = events.groupby("patient_token")["date"].agg(["min", "max"])
+    cutoff = first_surgery - pd.DateOffset(months=3 * gap_quarters)
+    has_history = set(cutoff.index[span["min"].reindex(cutoff.index) < cutoff])
+    positives = pd.Index(sorted(set(first_surgery.index) & split_pool & has_history))
+
     long_history = span[span["max"] >= span["min"] + pd.DateOffset(years=min_history_years)].index
     neg_pool = span.loc[sorted((set(long_history) & split_pool) - any_surgery)]
-    neg_index = _matched_index_dates(neg_pool, first_surgery.loc[positives], neg_ratio, seed)
+    neg_index = _matched_index_dates(neg_pool, first_surgery.loc[positives], neg_ratio, seed, gap_quarters)
 
-    pos = _window(positives, first_surgery, lookback_quarters).assign(label=1)
-    neg = _window(neg_index.index, neg_index, lookback_quarters).assign(label=0)
+    pos = _window(positives, first_surgery, gap_quarters=gap_quarters).assign(label=1)
+    neg = _window(neg_index.index, neg_index, gap_quarters=gap_quarters).assign(label=0)
     labelled = pd.concat([pos, neg], ignore_index=True)
-    return finish_splits(
-        labelled, patients, events, any_surgery, lookback_quarters, holdout_recent_quarters, extract_end
-    )
+    return finish_splits(labelled, patients, events, any_surgery, None, holdout_recent_quarters, extract_end)
 
 
 def finish_splits(
@@ -193,7 +213,7 @@ def finish_splits(
     patients: pd.DataFrame,
     events: pd.DataFrame,
     any_surgery: set,
-    lookback_quarters: int,
+    lookback_quarters: int | None,
     holdout_recent_quarters: int = 1,
     extract_end: pd.Timestamp = EXTRACT_END,
 ) -> pd.DataFrame:
@@ -201,7 +221,8 @@ def finish_splits(
 
     Holdout: patients-table patients with active coverage at the extract end, an
     event in the last `holdout_recent_quarters` quarters, no surgery evidence and
-    not in `labelled`. Index date = the day after the extract end.
+    not in `labelled`. Index date = the day after the extract end; its window is
+    the `lookback_quarters` quarters before it, or all history if None, with no gap.
     """
     labelled = labelled.assign(split=labelled["patient_token"].map(assign_split))
     covered = patients[
@@ -220,12 +241,12 @@ def finish_splits(
     return out.sort_values(["split", "patient_token"], ignore_index=True)
 
 
-def splits_filename(lookback_quarters: int, neg_ratio: float = 1.0, seed: int = 0) -> str:
-    return f"patient_windows_lookback{lookback_quarters}q_neg{neg_ratio:g}x_seed{seed}.csv"
+def splits_filename(gap_quarters: int, neg_ratio: float = 1.0, seed: int = 0) -> str:
+    return f"patient_windows_gap{gap_quarters}q_neg{neg_ratio:g}x_seed{seed}.csv"
 
 
 def write_splits(
-    lookback_quarters: int,
+    gap_quarters: int,
     data_dir: Path = Path("data"),
     out_dir: Path = Path("artifacts/splits"),
     neg_ratio: float = 1.0,
@@ -233,8 +254,8 @@ def write_splits(
 ) -> Path:
     """Build the splits from `data_dir` and write them to `out_dir`; returns the file path."""
     tables = load_tables(data_dir)
-    splits = build_splits(**tables, lookback_quarters=lookback_quarters, neg_ratio=neg_ratio, seed=seed)
+    splits = build_splits(**tables, gap_quarters=gap_quarters, neg_ratio=neg_ratio, seed=seed)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / splits_filename(lookback_quarters, neg_ratio, seed)
+    path = out_dir / splits_filename(gap_quarters, neg_ratio, seed)
     splits.to_csv(path, index=False, date_format="%Y-%m-%d")
     return path

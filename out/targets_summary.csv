@@ -1,0 +1,18 @@
+step,value
+holdout scored,17747.0
+surgery positive,6754.0
+PT positive,3104.0
+WM positive,2415.0
+PT or WM positive,4157.0
+dropped: not covered,0.0
+dropped: surgery evidence,0.0
+PT removed: enrolled in PT,657.0
+PT removed: prior PT care,1210.0
+WM removed: enrolled in WM,177.0
+on list,3492.0
+on list: PT only,1254.0
+on list: WM only,1600.0
+on list: PT+WM,638.0
+surgery_threshold,0.5
+PT_threshold,0.8199
+WM_threshold,0.7312
