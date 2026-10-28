@@ -198,7 +198,17 @@ Not all creative was created equal, but in this data the differences are small. 
 
 ## Results
 
-On the held out test set the model predicts 147 positives, 59 have outreach data, 20.3% of which enrolled. This leave of confident the model is atleast comparable to Meridians oureach enrollment rate over all 19.9% - and greater than their most recent out reach attempts 16.6%.
+On the held out test set the model predicts 147 positives, 59 have outreach data, 20.3% of which enrolled. This leave of confident the model is atleast comparable to Meridians oureach enrollment rate over all 19.9% - and greater than their most recent out reach attempts 16.6%. This result does not and cannot tell us about the 98 other patient that were predicted positive and do not have outreach data. Only a live study can do that.
+
+Held-out test set metrics for the final models (surgery: gap X = 4; PT/WM: 4-quarter lookback). Thresholds are the ones used for the list: surgery 0.5; PT 0.82 and WM 0.73 (each model's training positive rate).
+
+| Model | Test patients (pos / neg) | ROC AUC | Precision | Recall | TP | FP | FN | TN |
+|---|---|---|---|---|---|---|---|---|
+| Surgery | 559 (276 / 283) | 0.571 | 0.546 | 0.605 | 167 | 139 | 109 | 144 |
+| PT enrollment | 768 (640 / 128) | 0.620 | 0.869 | 0.591 | 378 | 57 | 262 | 71 |
+| WM enrollment | 338 (242 / 96) | 0.668 | 0.820 | 0.583 | 141 | 31 | 101 | 65 |
+
+Each model is evaluated on its own test cohort. Precision should be read against the base rate: the enrollment cohorts are mostly enrollers.
 
 ### The outreach list
 `uv run main.py score` (gap X = 4) scores 17,747 eligible patients:
@@ -214,8 +224,44 @@ That is more than one campaign quarter's volume (2,189–3,183 patients outreach
 
 ![Outreach and 90-day enrollment by quarter](figures/outreach_by_quarter.png)
 
+
+
+# Study Design
+
+Assignment: Randomly split the eligible pool 50/50 before applying either selection method.
+Outreach: Each method selects 900 patients for attempted contact, for 1,800 total.
+* 1,800 is the average number of unique patient contacted during a enrollment campaign. Using this number to match available capacity.
+Controls: Use comparable outreach timing, scripts, contact attempts, and staffing; blind the outreach team to assignment where feasible.
+Primary outcome: Enrollment within 90 days of the first contact attempt, whether or not the patient answers.
+Monitoring: Review allocation, outreach execution, and data quality weekly; analyze outcomes after all patients have completed 90 days of follow-up.
+
+## Study Evaluation
+### Primary metric: 90 day enrollment rate
+The primary metric of concern is the percentage of patients in teh outreach program who enroll in PT or WM within 90 days. 90 Day window because we have to draw the line some where - some patient enroll 700 days after first outreach. Median is 78 days, but there is a drop off shelf at 90 days
+
+![Days from first outreach attempt to enrollment](figures/enrollment_delay.png)
+
+Of the 3,990 patient-programs that enrolled after being contacted, 2,207 (55%) enrolled within 90 days of the first attempt (median 78 days, mean 134 days). Enrollments run at about 360–410 per 15 days for the first 75 days and about 280 in days 76–90. They then drop to about 150 right after day 90 and tail off for up to 700 days. (EDA Part L)
+
+
+### Historical mean: 19.9% enrollment rate
+Over all provided outreach data Meridian averages a 19.9 enrollment rate. While this number will not be what is used to measure final outcomes - this is the base enrollment rate I work with for the below calculations
+
+### Effect size: 
+Track and report difference in percentage points, relative lift, and additional observed enrollments of the 900 calls
+
+### Uncertainty: 
+Report a 95% confidence interval around the difference
+
+### Sensitivity: 
+80% power to detect a 5.5 percentage-point improvement - if the Vi model can achieve 25.4% agreement rate we can be very confident the result is driven by our model and not random chance.
+
+
+
 ## Tools used
 - **Claude Code** (Anthropic): pair programming for the `assignment/` modules, tests, EDA notebook, figures and documentation.
 - **Google**: background research, for example CPT code definitions and the 97001 → 97161–97163 change.
 - **Codex** (OpenAI): draft parts of EDA when Claude Code ran out of tokens. 
 - **ChatGPTx**: For discussion study design considerations
+
+

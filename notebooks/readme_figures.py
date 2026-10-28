@@ -13,6 +13,7 @@ brackets) with the same definitions:
     outreach_by_quarter.png     patients outreached / enrolled within 90 days per quarter [K]
     creative_enrollment.png     % enrolled within 90 days by campaign creative [M]
     creative_pca.png            PCA of model features, enrolled vs not, per creative [N]
+    enrollment_delay.png        days from first outreach attempt to enrollment [L]
 """
 
 import pickle
@@ -231,6 +232,33 @@ def creative_pca(pm: pd.DataFrame) -> None:
     save(fig, "creative_pca.png")
 
 
+def enrollment_delay(out: pd.DataFrame, enr: pd.DataFrame) -> None:
+    """Days from the first outreach attempt for a program to the first enrollment in it on or after that date."""
+    first = out.groupby(["patient_token", "program"]).date.min().rename("first_attempt").reset_index()
+    after = first.merge(enr[["patient_token", "program", "enrollment_date"]], on=["patient_token", "program"])
+    after = after[after.enrollment_date >= after.first_attempt]
+    lag = after.groupby(["patient_token", "program"]).agg(first_attempt=("first_attempt", "first"),
+                                                          enrollment_date=("enrollment_date", "min"))
+    days = (lag.enrollment_date - lag.first_attempt).dt.days
+    within = (days <= 90).mean()
+    print(f"enrolled after contact: {len(days):,}; median {days.median():.0f} d, mean {days.mean():.0f} d, "
+          f"{within:.0%} within 90 d")
+
+    fig, ax = plt.subplots(figsize=(9, 3.6))
+    bins = np.arange(-14.5, days.max() + 15, 15)  # an edge at 90.5, so day 90 is the last day of the orange part
+    ax.hist(days[days <= 90], bins=bins, color=ORANGE, edgecolor="white", linewidth=.6,
+            label=f"within 90 days: {(days <= 90).sum():,} ({within:.0%})")
+    ax.hist(days[days > 90], bins=bins, color=GRAY, edgecolor="white", linewidth=.6,
+            label=f"after 90 days: {(days > 90).sum():,} ({1 - within:.0%})")
+    ax.axvline(days.median(), color=INK, lw=1, ls="--")
+    ax.text(days.median() + 4, ax.get_ylim()[1] * .92, f"median {days.median():.0f} d", fontsize=8, color=INK)
+    ax.set(title=f"Days from first outreach attempt to enrollment ({len(days):,} patient-programs enrolled after contact, "
+                 "15-day bins)", xlabel="Days from first outreach attempt to enrollment", ylabel="Patient-programs")
+    ax.legend(frameon=False, loc="upper right")
+    ax.grid(axis="x", visible=False)
+    save(fig, "enrollment_delay.png")
+
+
 def main() -> None:
     FIGURES.mkdir(exist_ok=True)
     out, enr = load_outreach()
@@ -240,6 +268,7 @@ def main() -> None:
     pm = creative_table(out, enr)
     creative_enrollment(pm)
     creative_pca(pm)
+    enrollment_delay(out, enr)
 
 
 if __name__ == "__main__":
