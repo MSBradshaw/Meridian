@@ -33,7 +33,8 @@ def cli() -> None:
         print(f"\nwrote {ARTIFACTS_DIR / 'manifest.json'} and {ARTIFACTS_DIR / 'training_summary.csv'}")
     else:
         # Holdout -> surgery model -> PT/WM models on surgery positives -> eligibility
-        # rules -> list ordered by surgery score (see assignment/inference.py).
+        # rules -> list ordered by surgery score; scores prior-corrected to real-world
+        # rates (see assignment/inference.py).
         targets: pd.DataFrame
         targets, detail = run_inference(DATA_DIR, ARTIFACTS_DIR)
         validate_targets(targets)
@@ -42,7 +43,8 @@ def cli() -> None:
         detail.to_csv(OUT_DIR / "targets_detail.csv", index=False)
         stats = pd.concat([
             funnel(detail),
-            detail[["surgery_threshold", "PT_threshold", "WM_threshold"]].iloc[0].round(4),
+            detail[["surgery_threshold", "PT_threshold", "WM_threshold",
+                    "surgery_population_rate", "PT_population_rate", "WM_population_rate"]].iloc[0].round(4),
         ]).rename("value").rename_axis("step")
         stats.to_csv(OUT_DIR / "targets_summary.csv")
         print(stats.to_string())

@@ -283,6 +283,15 @@ Feature files used to be written rounded to 6 significant digits. The models wer
 
 The list leans heavily to WM, because the PT rules remove most PT positives: the people the PT model likes are often already in PT care. How far down the list to go is not yet decided. 6,755 surgery positives is far more than the real surgery rate (8.7%) implies, because 0.5 on a 50/50-trained model is not a calibrated real-world risk.
 
+### I4. Scores prior-corrected to population rates
+`run_inference` rescales each model's odds from its training positive rate to the rate observed in the extract (`inference.prior_correct`):
+- **Surgery:** 2.9%, the patients-table patients with a first surgery code in the extract, per patient per year (`annual_surgery_rate`).
+- **PT / WM:** 21.7% / 15.8%, the share of patients outreached for the program who enrolled within 90 days of the first attempt (`outreach_enrollment_rate`).
+
+`score` in `targets.csv` is the corrected surgery risk. `targets_detail.csv` adds `surgery_risk`, `PT_enroll_prob` and `WM_enroll_prob`, and keeps the raw scores. The rates are recomputed from the data on every run and written to `targets_summary.csv`. The correction is monotonic, so thresholds (still applied to raw scores), flags and the ranking are unchanged.
+
+It assumes the training negatives represent the population, which is only approximately true (history requirement and matched dates for surgery; explicit refusers for enrollment). A population backtest with Platt scaling would replace it.
+
 ## Program enrollment (PT, WM)
 
 Implemented in [`assignment/labels.py`](assignment/labels.py), with `labels_file=` in `assignment/train.py`. Tested in [`tests/test_labels.py`](tests/test_labels.py) and `tests/test_train.py`.

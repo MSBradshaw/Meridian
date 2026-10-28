@@ -16,3 +16,6 @@ on list: PT+WM,638.0
 surgery_threshold,0.5
 PT_threshold,0.8199
 WM_threshold,0.7312
+surgery_population_rate,0.0288
+PT_population_rate,0.2172
+WM_population_rate,0.1579

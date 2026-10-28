@@ -27,11 +27,25 @@ the models recorded in `artifacts/manifest.json` by `assignment.pipeline`:
 Features are rebuilt from the raw extract for each model with its saved
 vocabulary and train min/max scaling, so this also scores a newer extract.
 
+Scores are put on a real-world scale with a prior-shift correction: the models
+are trained on artificial class mixes (surgery 1:1, enrollment mostly
+enrollers), so each model's odds are rescaled from its training positive rate to
+the population rate observed in the extract (`prior_correct`):
+
+    surgery_risk     annual rate of new surgery among patients-table patients
+    PT/WM_enroll_prob  share of outreached patients who enrolled in the program
+                       within 90 days of the first attempt
+
+The correction is monotonic, so thresholds, flags and the ranking are unchanged;
+it only changes the numbers. It assumes the training negatives are representative
+of the population, which they only roughly are.
+
 Output, ordered by surgery score (highest first):
 
     targets         patient_token, program_recommended ("PT", "WM" or "PT+WM"), score
-                    (the surgery score)
-    targets_detail  the same plus every model score, threshold and rule outcome
+                    (the prior-corrected surgery risk)
+    targets_detail  the same plus every raw and corrected model score, threshold
+                    and rule outcome
 
     from assignment.inference import run_inference
     targets, detail = run_inference(Path("data"), Path("artifacts"))
@@ -60,6 +74,7 @@ from assignment.splits import EXTRACT_END, HOLDOUT, _events, _window
 PROGRAMS = ("PT", "WM")
 SURGERY_THRESHOLD = 0.5
 TARGET_COLUMNS = ["patient_token", "program_recommended", "score"]
+ENROLLMENT_WINDOW_DAYS = 90
 
 
 def load_manifest(artifacts_dir: Path) -> dict:
@@ -72,6 +87,36 @@ def load_manifest(artifacts_dir: Path) -> dict:
 def train_positive_rate(entry: dict) -> float:
     report = json.loads((Path(entry["run_dir"]) / "metrics_val.json").read_text())
     return report["train"]["positives"] / report["train"]["patients"]
+
+
+def prior_correct(scores: pd.Series, train_rate: float, true_rate: float) -> pd.Series:
+    """Rescale probabilities from a model trained at `train_rate` positives to a population at `true_rate`.
+
+    odds_true = odds_model * [true_rate / (1 - true_rate)] / [train_rate / (1 - train_rate)]
+    """
+    p = scores.clip(1e-6, 1 - 1e-6)
+    odds = p / (1 - p) * (true_rate / (1 - true_rate)) / (train_rate / (1 - train_rate))
+    return odds / (1 + odds)
+
+
+def annual_surgery_rate(tables: dict[str, pd.DataFrame], extract_end: pd.Timestamp = EXTRACT_END) -> float:
+    """Patients-table patients whose first surgery code falls in the extract, per patient per year."""
+    events = _events(tables["encounters"], tables["claims"])
+    patients = set(tables["patients"]["patient_token"])
+    first_surgery = events[events["is_surgery_code"]].groupby("patient_token")["date"].min()
+    n_surgery = first_surgery.index.isin(patients).sum()
+    years = (extract_end - events["date"].min() + pd.Timedelta(days=1)).days / 365.25
+    return n_surgery / len(patients) / years
+
+
+def outreach_enrollment_rate(tables: dict[str, pd.DataFrame], program: str, days: int = ENROLLMENT_WINDOW_DAYS) -> float:
+    """Share of patients outreached for `program` who enrolled in it within `days` of their first attempt."""
+    outreach = tables["outreach"]
+    first = outreach[outreach["program"] == program].groupby("patient_token")["timestamp"].min().dt.normalize()
+    enrolled = tables["enrollments"]
+    enrolled = enrolled[enrolled["program"] == program].merge(first.rename("first_attempt"), on="patient_token")
+    gap = (enrolled["enrollment_date"] - enrolled["first_attempt"]).dt.days
+    return enrolled.loc[gap.between(0, days), "patient_token"].nunique() / len(first)
 
 
 def holdout_rows(manifest: dict) -> pd.DataFrame:
@@ -185,10 +230,23 @@ def run_inference(
             scores.loc[program_scores.index, f"{program}_score"] = program_scores
 
     index_date = extract_end + pd.Timedelta(days=1)
-    eligible = eligibility(scores.index, load_program_tables(data_dir), index_date, extract_end)
+    tables = load_program_tables(data_dir)
+    eligible = eligibility(scores.index, tables, index_date, extract_end)
     detail = recommend(scores, eligible, surgery_threshold, program_thresholds)
+
+    # real-world scale: rescale each model from its training class mix to the population rate
+    surgery_rate = annual_surgery_rate(tables, extract_end)
+    detail["surgery_risk"] = prior_correct(detail["surgery_score"], train_positive_rate(manifest["surgery"]), surgery_rate)
+    rates = {"surgery_population_rate": surgery_rate}
+    for program in PROGRAMS:
+        rate = outreach_enrollment_rate(tables, program)
+        detail[f"{program}_enroll_prob"] = prior_correct(
+            detail[f"{program}_score"], train_positive_rate(manifest[f"enroll-{program}"]), rate
+        )
+        rates[f"{program}_population_rate"] = rate
+    detail["score"] = detail["surgery_risk"]
     detail = detail.assign(
-        surgery_threshold=surgery_threshold, **{f"{p}_threshold": program_thresholds[p] for p in PROGRAMS}
+        surgery_threshold=surgery_threshold, **{f"{p}_threshold": program_thresholds[p] for p in PROGRAMS}, **rates
     )
     targets = detail.loc[detail["program_recommended"] != "", TARGET_COLUMNS].reset_index(drop=True)
     return targets, detail

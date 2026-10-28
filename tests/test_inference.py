@@ -1,7 +1,16 @@
 import numpy as np
 import pandas as pd
+import pytest
 
-from assignment.inference import TARGET_COLUMNS, eligibility, funnel, recommend
+from assignment.inference import (
+    TARGET_COLUMNS,
+    annual_surgery_rate,
+    eligibility,
+    funnel,
+    outreach_enrollment_rate,
+    prior_correct,
+    recommend,
+)
 from assignment.utils import validate_targets
 
 THRESHOLDS = {"PT": 0.8, "WM": 0.7}
@@ -107,3 +116,37 @@ def test_eligibility_from_tables():
     assert e.prior_pt_care.tolist() == [False, False, False, True, False]
     assert e.enrolled_WM.tolist() == [False, False, False, False, True]
     assert not e.enrolled_PT.any()
+
+
+def test_prior_correct_maps_train_rate_to_population_rate_and_keeps_order():
+    p = pd.Series([0.1, 0.5, 0.9, 1.0])
+    out = prior_correct(p, train_rate=0.5, true_rate=0.02)
+    assert out[1] == pytest.approx(0.02)  # the training base rate maps to the population rate
+    assert out.is_monotonic_increasing and (out < 1).all()
+    pd.testing.assert_series_equal(prior_correct(p.iloc[:3], 0.3, 0.3), p.iloc[:3])  # same rate: unchanged
+
+
+def test_population_rates():
+    tables = {
+        "patients": pd.DataFrame({"patient_token": list("abcd")}),
+        "encounters": pd.DataFrame({
+            "patient_token": ["a", "b"], "event_date": pd.to_datetime(["2024-06-30", "2025-01-01"]),
+            "event_category": ["Spine Surgery", "Imaging"], "event_code": ["63030", "72100"],
+        }),
+        "claims": pd.DataFrame({
+            "patient_token": ["z"], "service_date": pd.to_datetime(["2024-07-01"]),
+            "code_system": ["CPT"], "code": ["22630"],  # not in the patients table: not counted
+        }),
+        "outreach": pd.DataFrame({
+            "patient_token": ["a", "a", "b", "c"], "program": ["PT", "PT", "PT", "WM"],
+            "timestamp": pd.to_datetime(["2025-01-01 10:00", "2025-02-01 09:00", "2025-01-05 09:00", "2025-01-01 09:00"]),
+        }),
+        "enrollments": pd.DataFrame({
+            "patient_token": ["a", "b", "c"], "program": ["PT", "PT", "PT"],
+            "enrollment_date": pd.to_datetime(["2025-04-01", "2025-06-01", "2025-01-10"]),
+        }),
+    }
+    # 1 of 4 patients over 1 year (2024-06-30 .. 2025-06-29)
+    assert annual_surgery_rate(tables, pd.Timestamp("2025-06-29")) == pytest.approx(0.25, rel=1e-3)
+    assert outreach_enrollment_rate(tables, "PT") == 0.5  # a enrolled 90 d after first attempt; b after 147 d
+    assert outreach_enrollment_rate(tables, "WM") == 0.0  # c enrolled in PT, not WM

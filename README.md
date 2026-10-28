@@ -55,7 +55,7 @@ I built a multi-stage prediction pipeline, run on every currently covered, recen
 | 2. Enrollment prediction models (PT, WM) | If we reach out, will they enroll rather than refuse? | Surgery-positive patients only |
 | 3. Rules filtering | Is it still appropriate to contact them about this program? | PT- and/or WM-positive patients |
 
-The output is `out/targets.csv` (`patient_token, program_recommended, score`), ranked by surgery score.
+The output is `out/targets.csv` (`patient_token, program_recommended, score`), ranked by surgery score. `score` is the surgery risk, rescaled to a real-world annual rate (see [Score calibration](#score-calibration)).
 
 **Why multiple stages instead of one model:**
 - **The two questions have different labels and populations.** Every patient has a surgery outcome. Only patients Meridian has enrolled or contacted have an enrollment outcome. One model would have to learn both from the smallest of these populations.
@@ -161,7 +161,7 @@ The problem was modeled as a binary classification task: will or won't have surg
 - **How many:** they are sampled 1:1 with positives (fixed seed).
 - **Index dates:** each negative gets an index date drawn at random from the positives' surgery dates. Only dates inside the negative's own data, and with data before the 4-quarter gap, are allowed.
 
-Matching index dates gives both classes the same calendar timing and the same amount of available history. Without it, the model could learn "short history = surgery". Because training is 50/50, scores are a ranking, not a calibrated real-world probability.
+Matching index dates gives both classes the same calendar timing and the same amount of available history. Without it, the model could learn "short history = surgery". Because training is 50/50, the raw model scores are far too high in absolute terms. At scoring time they are rescaled to the real surgery rate (see [Score calibration](#score-calibration)).
 
 I used an XGBoost model with fixed, untuned settings. Tree models are explainable through feature importance and have a strong track record across a variety of ML tasks. XGBoost is easier to explain than something like an SVM, and more robust to sparsity and noise than KNN.
 
@@ -198,7 +198,7 @@ Not all creative was created equal, but in this data the differences are small. 
 
 ## Results
 
-On the held out test set the model predicts 147 positives, 59 have outreach data, 20.3% of which enrolled. This leave of confident the model is atleast comparable to Meridians oureach enrollment rate over all 19.9% - and greater than their most recent out reach attempts 16.6%. This result does not and cannot tell us about the 98 other patient that were predicted positive and do not have outreach data. Only a live study can do that.
+On the held-out test set, the model predicts 147 positives. 59 of them have outreach data, and 20.3% (12) of those enrolled within 90 days. That leaves me confident the model is at least comparable to Meridian's overall outreach enrollment rate of 19.9%, and to its most recent campaign's 16.6%. With only 59 patients, the 95% interval is wide (roughly 10–31%), so the test set can't show that the list is better. It also can't tell us anything about the 88 other patients who were predicted positive but have no outreach data. Only a live study can do that.
 
 Held-out test set metrics for the final models (surgery: gap X = 4; PT/WM: 4-quarter lookback). Thresholds are the ones used for the list: surgery 0.5; PT 0.82 and WM 0.73 (each model's training positive rate).
 
@@ -216,28 +216,86 @@ Each model is evaluated on its own test cohort. Precision should be read against
 - 4,157 of those are PT and/or WM positive;
 - after the rules, **3,492 positive predictions** are on the list in `out/targets.csv`: 1,254 PT only, 1,600 WM only and 638 both.
 
-That is more than one campaign quarter's volume (2,189–3,183 patients outreached). The list is ranked by surgery score, so Meridian can work from the top down. I recommend reaching as far down as capacity allows - or according to the study design below - 900.
+That is more than one campaign quarter's volume (2,189–3,183 patients outreached). The list is ranked by surgery score, so Meridian can work from the top down. I recommend going as far down as outreach capacity allows. For the pilot below, that means the **top ~1,385 patients** of Vi's list, built from Vi's half of the eligible pool. That's half of Meridian's average campaign of 2,769 patients.
+
+### Score calibration
+The models are trained on artificial class mixes: surgery 1:1, and the enrollment cohorts 73–82% enrollers. Their raw scores rank patients well, but they aren't real-world probabilities; a raw surgery score of 0.5 doesn't mean a 50% chance of surgery.
+
+`main.py score` applies a **prior-shift correction**, rescaling each model's odds from its training positive rate to the rate actually observed in Meridian's population:
+
+`odds_real = odds_model × [π_real / (1 − π_real)] / [π_train / (1 − π_train)]`
+
+where:
+- **π (pi)** is the share of patients who have the outcome (the positive class): its base rate or prevalence.
+- **π_train** is that share in the model's training data: the fraction of training patients labelled positive. For surgery it's 0.50 because negatives were sampled 1:1.
+- **π_real** is that share in the real population the list is drawn from, measured from the extract.
+- **odds_model** is the raw score's odds, `p / (1 − p)`. **odds_real** converts back to a probability as `odds_real / (1 + odds_real)`.
+
+Multiplying by the ratio of the two base-rate odds moves the score from the training class mix to the real one.
+
+| Model | Training positive rate (π_train) | Population rate (π_real), computed from the extract | Corrected score means |
+|---|---|---|---|
+| Surgery | 0.50 | **2.9%**: new surgeries per patients-table patient per year | annual surgery risk |
+| PT enrollment | 0.82 | **21.7%** of patients outreached for PT enrolled within 90 days | P(enrolls in PT within 90 days if contacted) |
+| WM enrollment | 0.73 | **15.8%** of patients outreached for WM enrolled within 90 days | P(enrolls in WM within 90 days if contacted) |
+
+**What changes and what doesn't:**
+- **No change to the list.** The correction is monotonic, so the list, its order and the programs are unchanged.
+- **The surgery score** in `targets.csv` is now the corrected annual risk: median 4.6% on the list, 90th percentile 9.8%, against 2.9% for the population.
+- **The enrollment probabilities** (`PT_enroll_prob`, `WM_enroll_prob` in `targets_detail.csv`): median 28.5% (PT) and 24.9% (WM) for listed patients, against 21.7% and 15.8% for all outreached patients.
+- **Raw scores** are kept in `targets_detail.csv`.
+
+**Caveats:** this quick fix assumes the training negatives are representative of the population. They only roughly are: surgery negatives need 2+ years of history and get matched dates, and enrollment negatives are explicit refusers, not no-answers. Treat the corrected scores as approximate. The proper fix is a population backtest with a fixed horizon (score everyone as of a past date, observe outcomes, and fit Platt scaling on val, checked on test), which the 3-year extract only barely supports.
 
 **What this means for Meridian:**
 - **Measure what matters.** The question is whether reaching these patients *earlier* prevents surgery and gets them into conservative care, not whether they respond like everyone else. Meridian contacts 60% of its eventual surgery patients only after surgery.
-- **Answer it with a pilot.** A randomized pilot (list patients contacted vs. list patients held back) is how to answer that.
+- **Answer it with a pilot.** The randomized pilot below pits Vi's list against Meridian's current selection, each working from a random half of the eligible pool.
 
 ![Outreach and 90-day enrollment by quarter](figures/outreach_by_quarter.png)
 
+## Impact
+Meridian's goal is not only more enrollments. It wants to reach patients **earlier in their journey**, while PT or weight management can still prevent surgery. Today's outreach mostly comes too late. Of the 1,259 surgery patients Meridian contacted:
+- **60% (758) were first contacted after they had already had surgery.**
+- **14% (180) were first contacted only within the quarter (1–90 days) before surgery.** That is too little time for meaningful PT progress or weight loss.
+
+Only 25% (321) were reached more than 90 days before surgery.
+
+![First outreach attempt relative to first surgery](figures/outreach_timing.png)
+
+The surgery model is built for the opposite timing. It was trained only on data from at least a year (4 quarters) before surgery, so every patient it flags is flagged about a year ahead of when surgery would be expected.
+
+The early signal is real but modest: test AUC is 0.57, against 0.5 for chance. Ranking the list by this score still gives Meridian a year of lead time on every patient it calls, instead of the zero or one quarter it has now. Whether that earlier contact leads to more conservative care and fewer surgeries is what the pilot below is designed to test.
+
+### What surgery costs Meridian
+Meridian pays the total cost of care for every patient in the extract. Lumbar surgery is one of its largest cost categories, with a median all-in cost of **$28,096–$51,697** per procedure.
+
+From July 2023 to June 2026, **2,242** patients in Meridian's patients table had a performed (encounters) or paid (claims) lumbar surgery. That's an average of about **747 surgeries a year** (482, 1,043 and 717 in the three July–June years). This is a lower bound: it counts each patient's surgery once, not repeat procedures.
+
+**Blended cost:** I assume the fusions (22630, 22633) sit at the high end of the range and the decompressions (63030, 63047) at the low end. Meridian's mix is 51% fusion (1,151 of 2,242 first surgeries) and 49% decompression, which gives a **blended cost of about $40,200 per surgery**.
+
+| | Low ($28,096 each) | **Blended ($40,212 each)** | High ($51,697 each) |
+|---|---|---|---|
+| **Annual lumbar surgery spend (~747 surgeries)** | $21.0M | **$30.1M** | $38.6M |
+| Savings if surgeries drop 5% (~37 avoided) | $1.0M | **$1.5M** | $1.9M |
+| Savings if surgeries drop 10% (~75 avoided) | $2.1M | **$3.0M** | $3.9M |
+| Savings if surgeries drop 20% (~149 avoided) | $4.2M | **$6.0M** | $7.7M |
+
+At the blended cost, Meridian spends about **$30M a year on lumbar spine surgery**, and every 1% reduction (about 7 surgeries a year) is worth about **$300K a year**. These are gross savings: the cost of the PT and WM programs and of the outreach itself would need to be subtracted. Whether earlier outreach achieves any reduction is exactly what the pilot needs to measure.
 
 
 # Study Design
 
 Assignment: Randomly split the eligible pool 50/50 before applying either selection method.
-Outreach: Each method selects 900 patients for attempted contact, for 1,800 total.
-* 1,800 is the average number of unique patient contacted during a enrollment campaign. Using this number to match available capacity.
+Outreach: Each method selects about 1,385 patients for attempted contact, for about 2,770 total.
+* 2,769 is the average number of unique patients contacted per campaign quarter (2,189–3,183 across the four campaigns), so the pilot fits Meridian's existing capacity. Vi's arm takes the top of the list scored on Vi's half of the pool. The other arm uses Meridian's current selection on its half.
+* If capacity looks more like the most recent campaign (2,189 patients, about 1,095 per arm), the detectable effect grows to 5.0 points (see Sensitivity).
 Controls: Use comparable outreach timing, scripts, contact attempts, and staffing; blind the outreach team to assignment where feasible.
 Primary outcome: Enrollment within 90 days of the first contact attempt, whether or not the patient answers.
 Monitoring: Review allocation, outreach execution, and data quality weekly; analyze outcomes after all patients have completed 90 days of follow-up.
 
 ## Study Evaluation
 ### Primary metric: 90 day enrollment rate
-The primary metric of concern is the percentage of patients in teh outreach program who enroll in PT or WM within 90 days. 90 Day window because we have to draw the line some where - some patient enroll 700 days after first outreach. Median is 78 days, but there is a drop off shelf at 90 days
+The primary metric is the percentage of outreached patients who enroll in PT or WM within 90 days of the first contact attempt. We have to draw the line somewhere, since some patients enroll up to 700 days after first outreach. The median is 78 days, and there is a clear drop-off at 90 days.
 
 ![Days from first outreach attempt to enrollment](figures/enrollment_delay.png)
 
@@ -245,23 +303,31 @@ Of the 3,990 patient-programs that enrolled after being contacted, 2,207 (55%) e
 
 
 ### Historical mean: 19.9% enrollment rate
-Over all provided outreach data Meridian averages a 19.9 enrollment rate. While this number will not be what is used to measure final outcomes - this is the base enrollment rate I work with for the below calculations
+Across all the outreach data provided, Meridian's 90-day enrollment rate is 19.9% (2,207 of 11,075 outreached patients). The pilot's own control arm, not this number, is what the Vi arm will be measured against. 19.9% is the base rate I use for the calculations below. The rate has been falling, from 22.2% to 16.6% in the latest campaign, so the control arm may come in lower.
 
 ### Effect size: 
-Track and report difference in percentage points, relative lift, and additional observed enrollments of the 900 calls
+Track and report the difference in percentage points, the relative lift, and the additional enrollments across the ~1,385 patients contacted in each arm.
 
 ### Uncertainty: 
-Report a 95% confidence interval around the difference
+Report a 95% confidence interval around the difference.
 
 ### Sensitivity: 
-80% power to detect a 5.5 percentage-point improvement - if the Vi model can achieve 25.4% agreement rate we can be very confident the result is driven by our model and not random chance.
+Two-sided test, α = 0.05, 80% power, 19.9% base rate:
+
+| Patients per arm | Smallest detectable improvement | Vi arm enrollment rate needed | Extra enrollments per arm |
+|---|---|---|---|
+| **1,385** (half the average campaign) | **4.4 points** | **24.3%** | about 61 |
+| 1,095 (half the latest campaign) | 5.0 points | 24.9% | about 55 |
+| 900 | 5.5 points | 25.4% | about 50 |
+
+If Vi's list truly enrolls at 24.3% or better, the pilot has an 80% chance of showing a statistically significant difference. A smaller true improvement may go undetected, and a significant result still carries a 5% false-positive risk.
 
 
 
 ## Tools used
 - **Claude Code** (Anthropic): pair programming for the `assignment/` modules, tests, EDA notebook, figures and documentation.
-- **Google**: background research, for example CPT code definitions and the 97001 → 97161–97163 change.
+- **Google**: background research, for example medical code definitions.
 - **Codex** (OpenAI): draft parts of EDA when Claude Code ran out of tokens. 
-- **ChatGPTx**: For discussion study design considerations
+- **ChatGPT** (OpenAI): discussion of study design considerations.
 
 
